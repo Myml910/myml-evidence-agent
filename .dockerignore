@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.env
+.env.*
+!.env.example
+env.b64
+*.migration-manifest.json
+*.log
+.obsidian
+docs/.obsidian
+server/data
+server/runtime
+coverage
+npm-debug.log*

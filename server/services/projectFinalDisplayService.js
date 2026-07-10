@@ -1,0 +1,1705 @@
+const crypto = require('crypto');
+const { composeFinalPrompt } = require('./aiFinalPromptComposer');
+const { generatePatternImage } = require('./aiImageGenerator');
+const { analyzeMaterialShapeLevels } = require('./aiMaterialShapeAnalyzer');
+const {
+  getLatestProjectRunForCode,
+  getProjectRunsForCode,
+  recordProjectRunMetadata,
+  recordProjectGenerationResult,
+} = require('./projectRunStore');
+
+const FINAL_DISPLAY_PROMPT_TEMPLATE_ID = 'structured_ai';
+const FINAL_DISPLAY_FINAL_GENERATION_SOURCE = 'automated_flow_final_generation';
+const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID = 'material_board_reverse';
+const GENERATION_MATERIAL_MIN_SCORE = 0.8;
+const AGENT_FLOW_MAX_RETRIES = 3;
+const MAX_DESIGN_REFERENCE_MATERIAL_IMAGES = 4;
+const DESIGN_REFERENCE_SOURCE_FIELD = 'design_img';
+const EXTERNAL_EVIDENCE_SOURCE_FIELD = 'external_evidence_img';
+const MATERIAL_SHAPE_LEVELS = [
+  {
+    key: 'primary',
+    label: 'Primary material',
+    title: 'primary shape / core hero material',
+    focus: 'Only the strongest existing hero motif, main title lettering, core icon, character, badge, or largest visual unit. This is not an all-elements collection.',
+    countRule: 'Keep 1-3 independent core subjects at most. It is better to extract fewer clear primary materials than to include a full product board.',
+    hardBoundary: 'Do not include whole product carriers, complete plate/napkin/cup/packaging layouts, full screenshot boards, repeated strips, secondary frames, or tertiary scatter marks.',
+    output: 'A clean material image with large, clear, complete primary assets that can be placed into the history layout as the main visual.',
+  },
+  {
+    key: 'secondary',
+    label: 'Secondary material',
+    title: 'secondary shape / supporting structure material',
+    focus: 'Existing supporting icons, frames, borders, corner ornaments, medium motifs, ribbons, banners, and layout-supporting decorative structures.',
+    countRule: 'Keep 4-12 medium-weight reusable assets. Exclude the full primary hero, full title lockups, and excessive tiny scatter marks.',
+    hardBoundary: 'Do not repeat the primary hero material, do not include complete product pages, and do not include long full material strips as one object.',
+    output: 'A clean material image with reusable supporting assets for borders, corners, surrounding decoration, and series variation.',
+  },
+  {
+    key: 'tertiary',
+    label: 'Tertiary material',
+    title: 'tertiary shape / small accent material',
+    focus: 'Existing lightweight accents such as dots, small stars, sparkles, texture marks, tiny icons, micro patterns, and repeated rhythm marks.',
+    countRule: 'Keep many small accents only when they already exist in the input image. Do not include readable main text, primary icons, or medium frames.',
+    hardBoundary: 'Do not include primary title lockups, full badges, complete main icons, medium border groups, product carriers, or screenshot information.',
+    output: 'A clean material image with small accent marks and background-supporting details for density control.',
+  },
+];
+const ACCEPTED_ELEMENT_SOURCES = new Set([
+  'gallery_material_unified_cleanup',
+  'gallery_material_split_cleanup',
+  'company_design_reference_split',
+  'design_reference_unified_regeneration',
+]);
+const ACCEPTED_FINAL_SOURCES = new Set([
+  FINAL_DISPLAY_FINAL_GENERATION_SOURCE,
+  'manual_final_generation',
+]);
+const FAILED_JOB_RETRY_DELAY_MS = 60 * 1000;
+const COMPLETED_JOB_RESULT_CACHE_MS = 30 * 60 * 1000;
+const PROJECT_DATA_LAYER_LOOKUP_TIMEOUT_MS = 20 * 1000;
+const activeFinalDisplayJobs = new Map();
+
+function cleanString(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function normalizeProjectCode(value) {
+  const code = cleanString(value).toUpperCase();
+  return /^YXF\d{10}$/.test(code) ? code : '';
+}
+
+function safeBaseUrl(value) {
+  const raw = cleanString(value);
+  if (!raw) return '';
+
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+    parsed.search = '';
+    parsed.hash = '';
+    parsed.pathname = parsed.pathname.replace(/\/+$/g, '');
+    return parsed.toString().replace(/\/+$/g, '');
+  } catch (_error) {
+    return '';
+  }
+}
+
+function safeImageUrl(value) {
+  const raw = cleanString(value);
+  if (!raw || /^data:/i.test(raw) || /^javascript:/i.test(raw)) return '';
+  if (/^[a-z]:[\\/]/i.test(raw) || /^\\\\/.test(raw)) return '';
+
+  try {
+    const parsed = new URL(raw);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return '';
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.toString();
+  } catch (_error) {
+    return '';
+  }
+}
+
+function rootRelativePublicUrl(value) {
+  const raw = cleanString(value);
+  if (!raw || !raw.startsWith('/') || raw.startsWith('//')) return '';
+  return raw.split('?')[0].split('#')[0];
+}
+
+function absolutePublicUrl(value, publicBaseUrl = '') {
+  const absoluteUrl = safeImageUrl(value);
+  if (absoluteUrl) return absoluteUrl;
+
+  const relativeUrl = rootRelativePublicUrl(value);
+  if (!relativeUrl) return '';
+
+  const baseUrl = safeBaseUrl(publicBaseUrl);
+  return baseUrl ? `${baseUrl}${relativeUrl}` : relativeUrl;
+}
+
+function safeFilename(value) {
+  return cleanString(value).split(/[\\/]/).filter(Boolean).pop() || '';
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  const text = String(value || '');
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return hash >>> 0;
+}
+
+function createRunId(projectCode) {
+  return `prun-${projectCode}-final-display-${Date.now().toString(36)}-${crypto.randomBytes(3).toString('hex')}`;
+}
+
+function listFromText(value, maxItems = 12) {
+  return String(value || '')
+    .split(/[\n\r,;，；、]+/)
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function visibleTextElementSummary(value) {
+  return String(value || '')
+    .split(/[\n\r,;，；、]+/)
+    .map((item) => normalizeVisibleDesignText(item))
+    .filter((item) => /[a-z0-9]/i.test(item))
+    .filter(Boolean)
+    .slice(0, 8)
+    .join('; ');
+}
+
+function normalizeVisibleDesignText(value) {
+  return cleanString(value)
+    .replace(/[\u4e00-\u9fff]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s:："'“”‘’\-]+|[\s:："'“”‘’\-]+$/g, '');
+}
+
+function sanitizeDesignRequirementForGeneration(value) {
+  const fragments = String(value || '')
+    .replace(/\r?\n/g, ';')
+    .split(/[;；。!！?？]+/)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+  const keepPattern = /(文案|文字|图案|风格|参考图|配色|颜色|色系|底色|背景|渐变|可爱|卡通|线条|排版|主题|palette|color|background|gradient|style|reference|ref|text|copy|theme|happy|birthday|halloween|diwali|navidad|christmas|thank|pastor|flirty|thriving)/i;
+  const sizeOnlyPattern = /(尺寸|规格|大小|cm|mm|厘米|毫米|英寸|直径|长|宽|高|大餐盘|小餐盘|纸巾|杯套|刀模)/i;
+
+  return fragments
+    .map((fragment) => fragment
+      .replace(/\b\d+(?:\.\d+)?\s*(?:cm|mm|inch|in)\b/gi, '')
+      .replace(/\d+(?:\.\d+)?\s*(?:厘米|毫米|英寸)/g, '')
+      .replace(/\d+(?:\.\d+)?\s*[*x×]\s*\d+(?:\.\d+)?/gi, '')
+      .trim())
+    .filter(Boolean)
+    .filter((fragment) => keepPattern.test(fragment) || !sizeOnlyPattern.test(fragment))
+    .slice(0, 10)
+    .join('; ');
+}
+
+function parseChineseReferenceNumber(value) {
+  const raw = cleanString(value);
+  if (!raw) return 0;
+
+  const direct = Number(raw);
+  if (Number.isInteger(direct) && direct > 0) {
+    return direct;
+  }
+
+  const normalized = raw.replace(/\s+/g, '');
+  const digitMap = {
+    '一': 1,
+    '二': 2,
+    '两': 2,
+    '三': 3,
+    '四': 4,
+    '五': 5,
+    '六': 6,
+    '七': 7,
+    '八': 8,
+    '九': 9,
+    '十': 10,
+  };
+
+  if (digitMap[normalized]) {
+    return digitMap[normalized];
+  }
+  if (normalized === '十一') return 11;
+  if (normalized === '十二') return 12;
+  if (normalized.startsWith('十')) {
+    return 10 + (digitMap[normalized.slice(1)] || 0);
+  }
+  if (normalized.endsWith('十')) {
+    return (digitMap[normalized.slice(0, -1)] || 0) * 10;
+  }
+  if (normalized.includes('十')) {
+    const [tens, ones] = normalized.split('十');
+    return (digitMap[tens] || 0) * 10 + (digitMap[ones] || 0);
+  }
+
+  return 0;
+}
+
+function collectDesignRequirementReferenceIndices(proposal = {}) {
+  const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
+  const indices = new Set();
+  const referenceNumberGroupPattern = /[0-9]+|[一二两三四五六七八九十]+/g;
+  const patterns = [
+    /参考\s*(?:图|图片)\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
+    /(?:见|看|按|按照|根据)\s*(?:设计)?\s*参考?\s*(?:图|图片)\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
+    /(?:style|reference|ref)\s*(?:image|img|fig|figure)?\s*#?\s*([0-9,\s]+)/gi,
+  ];
+
+  for (const pattern of patterns) {
+    let match = pattern.exec(designRequirement);
+    while (match) {
+      const numberGroup = match[1] || '';
+      const numberMatches = numberGroup.match(referenceNumberGroupPattern) || [];
+      for (const numberText of numberMatches) {
+        const parsed = parseChineseReferenceNumber(numberText);
+        if (parsed > 0) {
+          indices.add(parsed);
+        }
+      }
+      match = pattern.exec(designRequirement);
+    }
+  }
+
+  return Array.from(indices).sort((left, right) => left - right);
+}
+
+function projectPreviewFromLookup(result) {
+  const proposal = result?.proposal || {};
+  const rawDesignRequirement = cleanString(proposal.design_requirement || proposal.development_requirement);
+  const categoryTargets = categoryTargetsFromLookup(result);
+  const categorySummary = categoryTargets.length > 0
+    ? categoryTargets.map((target) => target.category).join(' / ')
+    : cleanString(result?.category_judgment?.predicted_category || proposal.category_label || proposal.category);
+  return {
+    projectCode: result?.project_code || proposal.project_code || '',
+    title: cleanString(proposal.project_name).slice(0, 220),
+    category: categorySummary.slice(0, 180),
+    graphicElements: cleanString(proposal.ai_graphic_elements || proposal.element_requirement || proposal.real_graphic_elements).slice(0, 500),
+    textElements: visibleTextElementSummary(proposal.text_elements).slice(0, 500),
+    designRequirement: sanitizeDesignRequirementForGeneration(rawDesignRequirement).slice(0, 1000),
+    rawDesignRequirement: rawDesignRequirement.slice(0, 1600),
+  };
+}
+
+function selectedMaterialImagesFromLookup(result) {
+  const projectCode = result?.project_code || result?.proposal?.project_code || '';
+  const selected = Array.isArray(result?.selected_gallery_images?.selected_images)
+    ? result.selected_gallery_images.selected_images
+    : [];
+
+  return selected
+    .filter((image) => {
+      const score = Number(image.match_score);
+      return !Number.isFinite(score) || score >= GENERATION_MATERIAL_MIN_SCORE;
+    })
+    .slice(0, 2)
+    .map((image, index) => {
+      const imageUrl = safeImageUrl(image.url || image.image_url);
+      if (!imageUrl) return null;
+      return {
+        id: cleanString(image.image_id) || `gallery_material_${projectCode}_${index + 1}`,
+        projectCode,
+        title: cleanString(image.filename || image.label) || `Selected material ${index + 1}`,
+        category: 'selected_gallery_material',
+        source: 'company_gallery_material',
+        filename: safeFilename(image.filename || image.url || image.image_url),
+        imageUrl,
+        thumbnailUrl: imageUrl,
+      };
+    })
+    .filter(Boolean);
+}
+
+function designReferenceImagesFromLookup(result) {
+  const projectCode = result?.project_code || result?.proposal?.project_code || '';
+  const proposal = result?.proposal || {};
+  const referenceImages = Array.isArray(proposal.reference_images) ? proposal.reference_images : [];
+  const designImages = referenceImages.filter((image) => image?.source_field === DESIGN_REFERENCE_SOURCE_FIELD);
+  const externalEvidenceImages = referenceImages.filter((image) => image?.source_field === EXTERNAL_EVIDENCE_SOURCE_FIELD);
+  const sourceImages = designImages.length > 0 ? designImages : externalEvidenceImages;
+  const sourceLabel = designImages.length > 0 ? 'Company design reference' : 'External evidence reference';
+  const requestedIndices = collectDesignRequirementReferenceIndices(proposal);
+  const requestedIndexSet = new Set(requestedIndices);
+  const indexedImages = sourceImages
+    .filter((image) => safeImageUrl(image.url))
+    .map((image, index) => ({
+      image,
+      referenceIndex: index + 1,
+    }));
+  const selectedImages = requestedIndices.length > 0
+    ? indexedImages.filter((item) => requestedIndexSet.has(item.referenceIndex))
+    : indexedImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
+  const finalImages = selectedImages.length > 0
+    ? selectedImages
+    : indexedImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
+
+  return finalImages
+    .slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES)
+    .map(({ image, referenceIndex }) => {
+      const imageUrl = safeImageUrl(image.url);
+      if (!imageUrl) return null;
+      return {
+        id: `company_design_reference_${projectCode}_${referenceIndex}`,
+        projectCode,
+        title: cleanString(image.label) || `${sourceLabel} ${referenceIndex}`,
+        category: designImages.length > 0 ? 'company_design_reference' : 'external_evidence_reference',
+        source: designImages.length > 0 ? 'company_project_data' : 'external_evidence_data',
+        filename: safeFilename(image.filename || image.raw_path),
+        imageUrl,
+        thumbnailUrl: imageUrl,
+        sourceField: image.source_field,
+        referenceIndex,
+        selectedByDesignRequirement: requestedIndexSet.has(referenceIndex),
+      };
+    })
+    .filter(Boolean);
+}
+
+function designReferenceSourceLabel(images = []) {
+  return images.some((image) => image.sourceField === EXTERNAL_EVIDENCE_SOURCE_FIELD)
+    ? 'external evidence material'
+    : 'company design reference material';
+}
+
+function referenceImageForDataLayer(image, index) {
+  const sourceField = cleanString(image?.source_field);
+  const imageUrl = safeImageUrl(image?.url);
+  if (!imageUrl) return null;
+  return {
+    id: `reference_${sourceField || 'image'}_${index + 1}`,
+    index: index + 1,
+    sourceField,
+    role: sourceField === DESIGN_REFERENCE_SOURCE_FIELD
+      ? 'design_reference'
+      : sourceField === EXTERNAL_EVIDENCE_SOURCE_FIELD
+        ? 'external_evidence_reference'
+        : 'operation_or_other_reference',
+    label: cleanString(image.label) || `Reference image ${index + 1}`,
+    filename: safeFilename(image.filename || image.raw_path || image.url),
+    imageUrl,
+    thumbnailUrl: imageUrl,
+    usageScenario: sourceField === DESIGN_REFERENCE_SOURCE_FIELD
+      ? 'Used by the material extraction and final prompt data layer as company design reference. The original image is not passed as final image-generation input.'
+      : sourceField === EXTERNAL_EVIDENCE_SOURCE_FIELD
+        ? 'Fallback material evidence only when company design references are unavailable. The original external image is not passed as final image-generation input.'
+        : 'Company operation/reference image for data display only; not used as the main design material source by default.',
+  };
+}
+
+function buildProjectDataLayerFromLookup(result) {
+  const proposal = result?.proposal || {};
+  const referenceImages = Array.isArray(proposal.reference_images) ? proposal.reference_images : [];
+  const mappedReferenceImages = referenceImages
+    .map(referenceImageForDataLayer)
+    .filter(Boolean);
+  const designReferenceImages = mappedReferenceImages.filter((image) => image.sourceField === DESIGN_REFERENCE_SOURCE_FIELD);
+  const operationReferenceImages = mappedReferenceImages.filter((image) => image.sourceField !== DESIGN_REFERENCE_SOURCE_FIELD);
+  const graphicElementsRaw = cleanString(
+    proposal.ai_graphic_elements ||
+    proposal.element_requirement ||
+    proposal.real_graphic_elements,
+  );
+  const visibleText = visibleTextElementSummary(proposal.text_elements);
+  const categoryTargets = categoryTargetsFromLookup(result);
+  const categorySummary = categoryTargets.length > 0
+    ? categoryTargets.map((target) => target.category).join(' / ')
+    : cleanString(result?.category_judgment?.predicted_category || proposal.category_label || proposal.category);
+
+  return {
+    projectCode: result?.project_code || proposal.project_code || '',
+    trueCategory: categorySummary,
+    sections: {
+      categoryTargets: {
+        title: 'category_targets',
+        count: categoryTargets.length,
+        items: categoryTargets.map((target) => ({
+          category: target.category,
+          confidence: target.confidence,
+          reason: target.reason,
+          hasHistoryTemplate: Boolean(historyImageFromCategoryTarget(result, target)),
+        })),
+        usageScenario: 'For combo-category proposals, material extraction runs once while final prompt and final generation are repeated for each category-specific history layout template.',
+      },
+      designReferenceImages: {
+        title: 'company_design_reference_images',
+        count: designReferenceImages.length,
+        items: designReferenceImages,
+        usageScenario: 'Primary company reference source for extracting usable design materials, background/color cues, and design-language signals. Originals are not used directly as final image-generation inputs.',
+      },
+      graphicElements: {
+        title: 'graphic_elements',
+        aiExtracted: listFromText(graphicElementsRaw, 20),
+        raw: graphicElementsRaw,
+        realCompanyRaw: cleanString(proposal.real_graphic_elements),
+        usageScenario: 'Controls the required motif/theme boundary for material filtering, material shape analysis, and final prompt composition.',
+      },
+      textElements: {
+        title: 'text_elements',
+        visible: listFromText(visibleText, 12),
+        raw: cleanString(proposal.text_elements),
+        usageScenario: 'Only visible English/number text requirements enter final prompt composition. Chinese notes are treated as instructions, not text to print in the final design.',
+      },
+      operationReferenceImages: {
+        title: 'operation_or_external_reference_images',
+        count: operationReferenceImages.length,
+        items: operationReferenceImages,
+        usageScenario: 'Displayed for traceability. Operation references are not default design-material inputs; external evidence is fallback only when no company design reference is available.',
+      },
+    },
+  };
+}
+
+function buildFinalDisplayView(run, dataLayer = null) {
+  const safeRun = run || {};
+  const projectDataLayer = dataLayer || safeRun.projectDataLayer || null;
+  return {
+    materialImageBlock: Array.isArray(safeRun.elementImages) ? safeRun.elementImages : [],
+    finalImageGeneration: Array.isArray(safeRun.finalDesignImages) ? safeRun.finalDesignImages : [],
+    projectDataLayer,
+  };
+}
+
+function recordProjectDataLayerForRun({
+  dependencies,
+  normalizedCode,
+  runId,
+  project,
+  designReferenceImages,
+  dataLayer,
+}) {
+  if (!runId || !dataLayer) {
+    return null;
+  }
+
+  const recordMetadata = dependencies.recordProjectRunMetadata || recordProjectRunMetadata;
+  return recordMetadata({
+    project_code: normalizedCode,
+    project_run_id: runId,
+  }, {
+    project,
+    designReferenceImages,
+    projectDataLayer: dataLayer,
+  });
+}
+
+async function lookupProjectDataLayer({ normalizedCode, request, dependencies }) {
+  const lookupProject = typeof dependencies.prepareCompanyProjectDataLayerLookup === 'function'
+    ? dependencies.prepareCompanyProjectDataLayerLookup
+    : dependencies.prepareProjectDataLayerFromCompanyLookup || dependencies.prepareProposalFromCompanyLookup;
+  if (typeof lookupProject !== 'function') {
+    return null;
+  }
+
+  const publicBaseUrl = dependencies.publicBaseUrlFromRequest?.(request) || '';
+  try {
+    const lookup = await lookupProject({
+      projectCode: normalizedCode,
+      publicBaseUrl,
+    });
+    if (!lookup?.found) {
+      return null;
+    }
+    return {
+      lookup,
+      project: projectPreviewFromLookup(lookup),
+      dataLayer: buildProjectDataLayerFromLookup(lookup),
+    };
+  } catch (_error) {
+    return null;
+  }
+}
+
+async function lookupProjectDataLayerWithTimeout(args, timeoutMs = PROJECT_DATA_LAYER_LOOKUP_TIMEOUT_MS) {
+  let timeout = null;
+  try {
+    return await Promise.race([
+      lookupProjectDataLayer(args),
+      new Promise((resolve) => {
+        timeout = setTimeout(() => resolve(null), timeoutMs);
+        timeout.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timeout) {
+      clearTimeout(timeout);
+    }
+  }
+}
+
+function categoryTargetsFromLookup(result) {
+  const judgment = result?.category_judgment || {};
+  const imageByCategory = new Map(
+    (Array.isArray(judgment.category_images) ? judgment.category_images : [])
+      .filter((image) => cleanString(image?.category))
+      .map((image) => [cleanString(image.category), image]),
+  );
+  const rawTargets = Array.isArray(judgment.predicted_categories) && judgment.predicted_categories.length > 0
+    ? judgment.predicted_categories
+    : judgment.predicted_category
+      ? [{
+          category: judgment.predicted_category,
+          confidence: judgment.confidence,
+          reason: judgment.reason,
+          category_image: judgment.category_image,
+        }]
+      : [];
+  const seen = new Set();
+
+  return rawTargets
+    .map((target) => {
+      const category = cleanString(target?.category || target?.predicted_category);
+      const key = category.toLocaleLowerCase();
+      if (!category || seen.has(key)) {
+        return null;
+      }
+      seen.add(key);
+      return {
+        category,
+        confidence: Number(target.confidence) || 0,
+        reason: cleanString(target.reason),
+        categoryImage: target.category_image ||
+          imageByCategory.get(category) ||
+          (cleanString(judgment.category_image?.category) === category ? judgment.category_image : null),
+      };
+    })
+    .filter(Boolean);
+}
+
+function historyImageFromCategoryTarget(result, target) {
+  const categoryImage = target?.categoryImage || result?.category_judgment?.category_image;
+  const candidates = Array.isArray(categoryImage?.history_images) && categoryImage.history_images.length > 0
+    ? categoryImage.history_images
+    : categoryImage
+      ? [categoryImage]
+      : [];
+  const usableCandidates = candidates.filter((image) => safeImageUrl(image.image_url));
+  if (usableCandidates.length === 0) return null;
+  const seed = [
+    result?.project_code,
+    target?.category || result?.category_judgment?.predicted_category,
+    ...usableCandidates.map((image) => image.image_url),
+  ].join('|');
+  const first = usableCandidates[hashString(seed) % usableCandidates.length];
+  return {
+    id: `history_layout_${result.project_code}_${hashString(target?.category || categoryImage?.category || 'category')}`,
+    role: 'history',
+    label: `${target?.category || categoryImage?.category || 'Category'} history layout reference`,
+    filename: safeFilename(first.image_filename || first.image_url),
+    url: safeImageUrl(first.image_url),
+    detail: cleanString(first.note).slice(0, 300) || 'History layout reference for final design generation.',
+  };
+}
+
+function historyImageFromLookup(result) {
+  const target = categoryTargetsFromLookup(result)[0] || null;
+  return historyImageFromCategoryTarget(result, target);
+}
+
+function imageInputsFromProjectImages(images, role, detail) {
+  return images.map((image, index) => ({
+    id: image.id,
+    role,
+    label: image.title || `Project image ${index + 1}`,
+    filename: image.filename || `${image.id}.png`,
+    url: image.imageUrl,
+    detail,
+  }));
+}
+
+function imageInputsFromRunImages(images, publicBaseUrl = '') {
+  return images
+    .map((image, index) => ({
+      id: image.id || `element-${index + 1}`,
+      role: 'material',
+      label: image.title || `Split element image ${index + 1}`,
+      filename: `${image.id || `element-${index + 1}`}.png`,
+      url: absolutePublicUrl(image.imageUrl, publicBaseUrl),
+      detail: 'Generated material image from the project production flow.',
+    }))
+    .filter((image) => image.url);
+}
+
+function materialShapeAnalysisRequiresSplit(analysis) {
+  return !analysis || analysis.status !== 'success' || analysis.split_required !== false;
+}
+
+function materialShapeAnalysisSummary(analysis) {
+  if (!analysis || typeof analysis !== 'object') {
+    return 'shape analysis unavailable';
+  }
+
+  return [
+    analysis.split_required === false ? 'split not required' : 'split required',
+    cleanString(analysis.split_reason),
+    cleanString(analysis.single_material_guidance),
+  ].filter(Boolean).join('; ');
+}
+
+const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE = [
+  '## Image Prompt Description',
+  '',
+  '**1. Core Subject & Theme (核心主体与主题):**',
+  '[Summarize the main content in one sentence]',
+  '',
+  '**2. Art Style & Medium (艺术风格与媒介):**',
+  '[Describe the art style, medium, lines, and aesthetic]',
+  '',
+  '**3. Color Palette & Lighting (配色与光影):**',
+  '[Describe colors, lighting quality, and atmosphere]',
+  '',
+  '**4. Composition & Perspective (构图与视角):**',
+  '[Describe layout, balance, and view angle]',
+  '',
+  '**5. Detailed Visual Elements (分层细节描述):**',
+  '',
+  '*   **Main Focus (Center/Midground):** [Describe the core elements]',
+  '*   **Background & Atmosphere:** [Describe the setting and environment]',
+  '*   **Foreground & Framing:** [Describe foreground elements]',
+  '*   **Specific Details/Props:** [Describe specific objects, patterns]',
+  '',
+  '**6. Text & Typography (If any):**',
+  '[Describe text content and font style if applicable. If none, write "None".]',
+].join('\n');
+
+function buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis) {
+  return [
+    'Analyze the provided unified material board and describe only the visual content that already exists in the image.',
+    `Material source: ${sourceLabel}. Source images: ${sourceNames || '-'}.`,
+    shapeAnalysis ? `Previous AI shape decision: ${materialShapeAnalysisSummary(shapeAnalysis)}.` : '',
+    'Return only the requested Markdown visual description. Do not explain the workflow and do not add extra sections.',
+    '',
+    MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE,
+  ].filter(Boolean).join('\n');
+}
+
+function buildMaterialBoardRegenerationPrompt(reverseDescription, sourceLabel, sourceNames) {
+  return [
+    'Generate a new clean unified material board using text-to-image only, based strictly on the reverse-engineered visual description below.',
+    '',
+    `Material source: ${sourceLabel}. Original source images: ${sourceNames || '-'}.`,
+    'This is a material-board regeneration step, not a final product design and not a new theme creation task.',
+    'Preserve the motif shapes, lettering shapes, linework, texture, local decorations, border language, and color relationships described below.',
+    'Do not add new subjects, new readable text, new icons, new characters, or new decorations that are not described.',
+    'Do not recreate the original product carrier, product mockup, screenshot interface, price/platform/store information, measurements, shadows, or scene background.',
+    'Output a clean unified material board on a plain background with clear spacing between independent reusable assets. It must be suitable to combine with primary/secondary/tertiary material assets in the final image input.',
+    '',
+    'Reverse-engineered visual description:',
+    reverseDescription,
+  ].join('\n');
+}
+
+function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shapeAnalysis }) {
+  const isSplit = Boolean(shapeLevel);
+  return [
+    `Process ${sourceLabel} into clean reusable material assets for the MYML default automatic flow.`,
+    'This is an extraction/cleanup task, not final product design and not theme re-creation.',
+    'Only extract, clean, group, and arrange visual assets that already exist in the input images. Do not redraw similar assets from text and do not invent missing objects.',
+    isSplit
+      ? `Extract only this material layer: ${shapeLevel.title || shapeLevel.label}.`
+      : 'AI has judged that forced primary/secondary/tertiary splitting is not needed. Create one unified cleaned material board.',
+    project.graphicElements ? `Graphic elements: ${project.graphicElements}` : '',
+    project.textElements ? `Text elements: ${project.textElements}` : '',
+    project.designRequirement ? `Design requirement directives used only for selection, not for inventing new assets: ${project.designRequirement}` : '',
+    shapeAnalysis?.split_reason ? `Shape analysis: ${shapeAnalysis.split_reason}` : '',
+    !shapeLevel && shapeAnalysis?.single_material_guidance
+      ? `Unified material guidance: ${shapeAnalysis.single_material_guidance}`
+      : '',
+    shapeLevel && shapeAnalysis?.levels?.[shapeLevel.key]?.prompt_guidance
+      ? `Layer guidance: ${shapeAnalysis.levels[shapeLevel.key].prompt_guidance}`
+      : '',
+    shapeLevel?.focus ? `Layer focus: ${shapeLevel.focus}` : '',
+    shapeLevel?.countRule ? `Layer count boundary: ${shapeLevel.countRule}` : '',
+    shapeLevel?.hardBoundary ? `Hard boundary: ${shapeLevel.hardBoundary}` : '',
+    shapeLevel?.output ? `Output target: ${shapeLevel.output}` : '',
+    'Carrier removal rule: remove product carriers, plates, napkins, cups, forks, packaging, screenshots, product cards, measurements, red size lines, price/platform/store information, watermarks, shadows, scene backgrounds, and non-pattern annotations.',
+    'Layer exclusivity rule: do not mix primary, secondary, and tertiary layers in the same output. If this is a unified board, keep independent usable assets separated with clear spacing.',
+    'Text rule: keep lettering shapes only when the text already exists in the input image and matches the project text requirement; Chinese notes or platform descriptions are not final design text.',
+    'Output form: a clean plain-background material board, with complete edges, clear spacing, and production-friendly reusable assets. Do not output a final product mockup or the original complete reference layout.',
+  ].filter(Boolean).join('\n');
+}
+
+function buildFinalTemplatePrompt(project, elementImages, hasHistoryImage, inputImages = []) {
+  const inputOrder = inputImages
+    .map((image, index) => {
+      const roleLabel = image.role === 'history'
+        ? 'history layout / composition master'
+        : image.role === 'material'
+          ? 'material image / reusable motif source'
+          : image.role || 'reference image';
+      return `Image ${index + 1}: ${image.filename || image.label || image.id} | role: ${roleLabel} | detail: ${image.detail || '-'}`;
+    })
+    .join('\n');
+  const materialSummary = elementImages
+    .map((image, index) => {
+      const source = cleanString(image.source);
+      const sourceLabel = source.includes('design_reference')
+        ? 'company design reference extracted material'
+        : source.includes('gallery')
+          ? 'internal gallery material'
+          : 'material image';
+      return `${index + 1}. ${image.title || image.id || `material ${index + 1}`} (${sourceLabel})`;
+    })
+    .join('\n');
+  const textRequirement = project.textElements
+    ? `Required visible text elements: ${project.textElements}. These must appear exactly and readably in the final pattern. Chinese notes in source fields are not final design text.`
+    : 'Text element requirement: empty. Do not add new core slogans, Chinese notes, platform words, or readable theme text unless it already exists as a required material shape.';
+  const designRequirement = project.designRequirement
+    ? `Development design directives after removing carrier size/spec information: ${project.designRequirement}`
+    : '';
+
+  return [
+    'Current final prompt template branch: structured_ai.',
+    'This template is not submitted directly to the image model. A prompt-writing AI must first read the input images and this template, then output the real final prompt for image generation.',
+    'The final image-generation input must contain only three blocks: 1) history layout image block, 2) material/reference image block, 3) the AI-composed final prompt.',
+    project.title ? `Project title: ${project.title}` : '',
+    project.category ? `Product category: ${project.category}` : '',
+    project.graphicElements ? `Required main graphic elements: ${project.graphicElements}` : 'Required main graphic elements: use the project development requirement and extracted materials as the theme boundary.',
+    textRequirement,
+    designRequirement,
+    `Material image count: ${elementImages.length}`,
+    materialSummary ? `Material image block:\n${materialSummary}` : '',
+    inputOrder ? `Input image order is binding:\n${inputOrder}` : '',
+    hasHistoryImage
+      ? [
+          'Input image role rule: image 1 is the history design image / layout master. It controls canvas aspect ratio, layout scale inside the canvas, margins, blank areas, design-unit count, unit positions, unit shapes, density, and repetition rhythm.',
+          'Images 2 and later are material images / reusable motif sources. They control existing motif appearance, lettering shapes, linework, texture, local decoration, border language, and color relationships.',
+          'History layout strategy: first decide history_layout_lock_policy from the real category and image 1. Use geometry_lock for fixed production structures such as cup sleeves, die lines, packaging, napkins, plates, fixed print slots, and cut templates. Use layout_lock for normal layout/collage/all-over masters. Use flexible_reference only when image 1 is directional or the category requires a free-shape redesign.',
+          'If geometry_lock is chosen, the real final prompt must explicitly preserve die-line outlines, red cut-line positions, center waist notches, upper/lower print-slot relations, unit spacing, outer blank areas, and the original canvas aspect ratio. Never stretch, squash, crop, enlarge, shrink, move, or reframe image 1 to fill the output canvas.',
+          'If layout_lock or flexible_reference is chosen, do not over-lock every line, but still preserve image 1 canvas aspect ratio, design-unit count, relative positions, scale within canvas, and required blank areas.',
+          'Historical content ban: old text, old motifs, old theme, old characters, old scenes, old borders, old background texture, and old colorway from image 1 are forbidden in the new design. Image 1 only controls structure.',
+          'Background strategy: white in the history image or extracted material board means blank layout/padding/cutout background, not necessarily the final design background. Background color, gradient, texture, small background elements, and atmosphere should come from development directives and company design-reference material/text signals. Apply backgrounds only inside existing historical design slots; keep outside-slot padding, dimension areas, and structural blanks clean.',
+          'Material fidelity strategy: use the material images as actual material sources, not as vague style references. Preserve existing usable motifs, lettering shapes, linework, border language, and local decorations as much as possible. Only invent new elements when explicitly required by text and missing from materials.',
+          'Single-pattern design definition: one pattern design means one independent closed print slot / die area / crop region inside image 1, not the whole output canvas. If image 1 contains multiple slots, refine each slot separately while keeping a coherent series.',
+        ].join('\n')
+      : 'No history layout image is available. The default automatic full flow must not generate a final design without a history layout; it should stop after material output.',
+    'Structured design dimensions to preserve in the real final prompt: Core Subject & Theme, Art Style & Medium, Color Palette & Lighting, Composition & Perspective, Detailed Visual Elements, Text & Typography. These are internal design-control dimensions, not Markdown to be drawn into the image.',
+    'Avoid formulaic output: do not make a mechanical "layout template plus stickers" result. The final design should look like a complete commercial product pattern series.',
+    'Final image quality rule: Clean and polished image, controllable details, smooth and consistent textures, clear subject-background separation, no over-sharpening, no color blotches, no noise, no broken patterns, no artifacts, and no distortion.',
+    'Forbidden deviations: do not output a single badge, single plate, product mockup, screenshot, poster, new cropped composition, or material-board display unless image 1 itself has that exact format. Do not reuse old content from image 1.',
+  ].filter(Boolean).join('\n');
+}
+
+function buildFallbackFinalPrompt(project, elementImages, hasHistoryImage) {
+  return [
+    buildFinalTemplatePrompt(project, elementImages, hasHistoryImage),
+    'Generate a polished final commercial design image. Keep motif distribution clean, coherent, and production-ready.',
+  ].join('\n');
+}
+
+function imageRecordWithPublicUrls(image, publicBaseUrl = '') {
+  if (!image || typeof image !== 'object') return image;
+
+  const imageUrl = absolutePublicUrl(image.imageUrl, publicBaseUrl);
+  const thumbnailUrl = absolutePublicUrl(image.thumbnailUrl, publicBaseUrl) || imageUrl;
+
+  return {
+    ...image,
+    imageUrl: imageUrl || image.imageUrl,
+    thumbnailUrl: thumbnailUrl || image.thumbnailUrl || imageUrl || image.imageUrl,
+  };
+}
+
+function runWithPublicUrls(run, publicBaseUrl = '') {
+  if (!run || typeof run !== 'object') return run;
+
+  return {
+    ...run,
+    elementImages: Array.isArray(run.elementImages)
+      ? run.elementImages.map((image) => imageRecordWithPublicUrls(image, publicBaseUrl))
+      : [],
+    finalDesignImages: Array.isArray(run.finalDesignImages)
+      ? run.finalDesignImages.map((image) => imageRecordWithPublicUrls(image, publicBaseUrl))
+      : [],
+  };
+}
+
+function generationOutputRun(run) {
+  if (!run || typeof run !== 'object') return null;
+
+  return {
+    ...run,
+    elementImages: Array.isArray(run.elementImages)
+      ? sortElementImagesForFinalInput(
+        run.elementImages.filter((image) => ACCEPTED_ELEMENT_SOURCES.has(cleanString(image.source))),
+      )
+      : [],
+    finalDesignImages: Array.isArray(run.finalDesignImages)
+      ? run.finalDesignImages.filter((image) => ACCEPTED_FINAL_SOURCES.has(cleanString(image.source)))
+      : [],
+  };
+}
+
+function materialShapeLevelIndexFromRecord(image) {
+  const text = [
+    image?.source,
+    image?.title,
+    image?.generation_label,
+    image?.label,
+  ].map(cleanString).join(' ').toLowerCase();
+  if (text.includes('primary')) return 0;
+  if (text.includes('secondary')) return 1;
+  if (text.includes('tertiary')) return 2;
+  return MATERIAL_SHAPE_LEVELS.length;
+}
+
+function finalMaterialSourceIndexFromRecord(image) {
+  const source = cleanString(image?.source);
+  if (source === 'company_design_reference_split' || source === 'design_reference_unified_regeneration') {
+    return 0;
+  }
+  if (source === 'gallery_material_unified_cleanup' || source === 'gallery_material_split_cleanup') {
+    return 1;
+  }
+  return 2;
+}
+
+function sortElementImagesForFinalInput(images = []) {
+  return [...images].sort((first, second) => {
+    const levelDifference = materialShapeLevelIndexFromRecord(first) - materialShapeLevelIndexFromRecord(second);
+    if (levelDifference !== 0) return levelDifference;
+
+    const sourceDifference = finalMaterialSourceIndexFromRecord(first) - finalMaterialSourceIndexFromRecord(second);
+    if (sourceDifference !== 0) return sourceDifference;
+
+    return cleanString(first?.id).localeCompare(cleanString(second?.id));
+  });
+}
+
+function hasDisplayRun(run) {
+  return run &&
+    Array.isArray(run.elementImages) &&
+    run.elementImages.length > 0 &&
+    Array.isArray(run.finalDesignImages) &&
+    run.finalDesignImages.length > 0;
+}
+
+function hasAnyDisplayImage(run) {
+  return run &&
+    (
+      (Array.isArray(run.elementImages) && run.elementImages.length > 0) ||
+      (Array.isArray(run.finalDesignImages) && run.finalDesignImages.length > 0)
+    );
+}
+
+function isProjectFinalDisplayRunId(value) {
+  return /^prun-/.test(cleanString(value));
+}
+
+function isReusableFinalDisplayRun(run) {
+  const runId = cleanString(run?.runId);
+  return isProjectFinalDisplayRunId(runId) && hasDisplayRun(generationOutputRun(run));
+}
+
+function isPartialFinalDisplayRun(run) {
+  const runId = cleanString(run?.runId);
+  return isProjectFinalDisplayRunId(runId) && hasAnyDisplayImage(generationOutputRun(run));
+}
+
+function getProjectRunsForCodeFromDependencies(dependencies, projectCode) {
+  if (typeof dependencies.getProjectRunsForCode === 'function') {
+    return dependencies.getProjectRunsForCode(projectCode);
+  }
+
+  if (typeof dependencies.projectRunStore?.getProjectRunsForCode === 'function') {
+    return dependencies.projectRunStore.getProjectRunsForCode(projectCode);
+  }
+
+  return getProjectRunsForCode(projectCode);
+}
+
+function latestReusableOutputRunForCode(dependencies, projectCode) {
+  const runs = getProjectRunsForCodeFromDependencies(dependencies, projectCode);
+  const reusable = runs.find(isReusableFinalDisplayRun);
+  return reusable ? generationOutputRun(reusable) : null;
+}
+
+function latestOutputRunForCode(dependencies, projectCode) {
+  const runs = getProjectRunsForCodeFromDependencies(dependencies, projectCode);
+  const reusable = runs.find(isReusableFinalDisplayRun);
+  if (reusable) return generationOutputRun(reusable);
+
+  const partial = runs.find(isPartialFinalDisplayRun);
+  return partial ? generationOutputRun(partial) : null;
+}
+
+function latestProjectRunForCode(dependencies, projectCode) {
+  if (typeof dependencies.getLatestProjectRunForCode === 'function') {
+    return dependencies.getLatestProjectRunForCode(projectCode);
+  }
+
+  if (typeof dependencies.projectRunStore?.getLatestProjectRunForCode === 'function') {
+    return dependencies.projectRunStore.getLatestProjectRunForCode(projectCode);
+  }
+
+  return getLatestProjectRunForCode(projectCode);
+}
+
+async function runAgentFlowStep(stepName, action) {
+  let lastError = null;
+  for (let attempt = 1; attempt <= AGENT_FLOW_MAX_RETRIES; attempt += 1) {
+    try {
+      return await action(attempt);
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (lastError.retryable === false) {
+        throw lastError;
+      }
+    }
+  }
+
+  const error = lastError || new Error(`${stepName} failed.`);
+  error.stepName = stepName;
+  throw error;
+}
+
+function hasRecordedImageForRequest(run, collection, source, label) {
+  const images = Array.isArray(run?.[collection]) ? run[collection] : [];
+  const expectedSource = cleanString(source);
+  const expectedLabel = cleanString(label);
+  return images.some((image) =>
+    cleanString(image.source) === expectedSource &&
+    (!expectedLabel || cleanString(image.title) === expectedLabel)
+  );
+}
+
+function recordedImageForRequest(run, collection, source, label) {
+  const images = Array.isArray(run?.[collection]) ? run[collection] : [];
+  const expectedSource = cleanString(source);
+  const expectedLabel = cleanString(label);
+  return images.find((image) =>
+    cleanString(image.source) === expectedSource &&
+    (!expectedLabel || cleanString(image.title) === expectedLabel)
+  ) || null;
+}
+
+function recordedImageToInputImage(image, publicBaseUrl = '', fallbackLabel = 'Generated material image') {
+  if (!image) return null;
+  const imageUrl = absolutePublicUrl(image.imageUrl, publicBaseUrl);
+  if (!imageUrl) return null;
+  return {
+    id: cleanString(image.id) || `generated_${Date.now()}`,
+    role: 'material',
+    label: cleanString(image.title) || fallbackLabel,
+    filename: safeFilename(image.imageUrl || image.id) || `${cleanString(image.id) || 'generated-material'}.png`,
+    url: imageUrl,
+    detail: cleanString(image.title) || fallbackLabel,
+  };
+}
+
+async function analyzeMaterialSource({
+  analyzeShapes,
+  project,
+  sourceKind,
+  inputImages,
+}) {
+  const result = await analyzeShapes({
+    project_code: project.projectCode,
+    category: project.category,
+    source_kind: sourceKind,
+    graphic_elements: listFromText(project.graphicElements),
+    text_elements: listFromText(project.textElements),
+    design_requirement_directives: listFromText(project.designRequirement, 8),
+    input_images: inputImages,
+  });
+
+  if (!result || result.status !== 'success') {
+    const upstream = result?.ai_error;
+    const message = upstream?.message ||
+      `AI material shape analysis did not complete successfully for ${sourceKind}.`;
+    const error = new Error(message);
+    error.statusCode = 502;
+    error.code = 'EVIDENCE_AGENT_MATERIAL_SHAPE_ANALYSIS_FAILED';
+    error.retryable = result?.status !== 'missing_config';
+    throw error;
+  }
+
+  return result;
+}
+
+async function generateAndRecordImage({
+  generateImage,
+  recordResult,
+  dependencies,
+  normalizedCode,
+  request,
+}) {
+  const result = await generateImage(request);
+  if (result.status !== 'success' || !Array.isArray(result.images) || result.images.length === 0) {
+    const error = new Error(result.ai_error?.message || 'Project image generation failed.');
+    error.statusCode = 502;
+    error.code = request.generation_stage === 'final_design'
+      ? 'EVIDENCE_AGENT_FINAL_GENERATION_FAILED'
+      : 'EVIDENCE_AGENT_MATERIAL_GENERATION_FAILED';
+    error.retryable = true;
+    throw error;
+  }
+
+  const recordedRun = recordResult(request, result);
+  return recordedRun || latestProjectRunForCode(dependencies, normalizedCode);
+}
+
+async function generateMaterialOutputs({
+  analyzeShapes,
+  composePrompt,
+  generateImage,
+  recordResult,
+  dependencies,
+  normalizedCode,
+  runId,
+  publicBaseUrl,
+  project,
+  sourceImages,
+  sourceKind,
+  sourceLabel,
+  unifiedSource,
+  splitSource,
+  unifiedLabel,
+}) {
+  if (!Array.isArray(sourceImages) || sourceImages.length === 0) {
+    return latestProjectRunForCode(dependencies, normalizedCode);
+  }
+
+  const inputImages = imageInputsFromProjectImages(
+    sourceImages,
+    sourceKind === 'material' ? 'material_cleanup' : 'design_reference_material_source',
+    `${sourceLabel} used by evidence-agent material extraction.`,
+  );
+  const shapeAnalysis = await analyzeMaterialSource({
+    analyzeShapes,
+    project,
+    sourceKind,
+    inputImages,
+  });
+  const splitRequired = materialShapeAnalysisRequiresSplit(shapeAnalysis);
+  const levels = splitRequired ? MATERIAL_SHAPE_LEVELS : [null];
+
+  let currentRun = latestProjectRunForCode(dependencies, normalizedCode);
+  for (const shapeLevel of levels) {
+    const generationSource = shapeLevel ? splitSource : unifiedSource;
+    const generationLabel = shapeLevel ? `${sourceLabel} ${shapeLevel.label}` : unifiedLabel;
+    const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
+    const isDesignReferenceUnified = !shapeLevel && sourceKind === 'design_reference';
+    const hasExistingGeneratedImage = hasRecordedImageForRequest(
+      rawRun,
+      'elementImages',
+      generationSource,
+      generationLabel,
+    );
+    if (hasExistingGeneratedImage && !isDesignReferenceUnified) {
+      currentRun = rawRun || currentRun;
+      continue;
+    }
+
+    if (hasExistingGeneratedImage) {
+      currentRun = rawRun || currentRun;
+    } else {
+      const request = {
+        prompt: buildMaterialProcessingPrompt({
+          sourceLabel,
+          project,
+          shapeLevel,
+          shapeAnalysis,
+        }),
+        project_code: normalizedCode,
+        project_run_id: runId,
+        generation_stage: 'element_image',
+        generation_source: generationSource,
+        generation_label: generationLabel,
+        category: project.category,
+        input_images: inputImages,
+      };
+      currentRun = await generateAndRecordImage({
+        generateImage,
+        recordResult,
+        dependencies,
+        normalizedCode,
+        request,
+      }) || currentRun;
+    }
+
+    if (isDesignReferenceUnified) {
+      const latestRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
+      const regeneratedSource = 'design_reference_unified_regeneration';
+      const regeneratedLabel = 'Regenerated unified design reference material';
+      if (hasRecordedImageForRequest(latestRun, 'elementImages', regeneratedSource, regeneratedLabel)) {
+        currentRun = latestRun;
+        continue;
+      }
+
+      const unifiedRecord = recordedImageForRequest(
+        latestRun,
+        'elementImages',
+        generationSource,
+        generationLabel,
+      );
+      const unifiedInputImage = recordedImageToInputImage(
+        unifiedRecord,
+        publicBaseUrl,
+        generationLabel,
+      );
+      if (!unifiedInputImage) {
+        continue;
+      }
+
+      const sourceNames = sourceImages.map((image) => image.filename).filter(Boolean).join(', ');
+      const reverseResponse = await composePrompt({
+        template_prompt: buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis),
+        prompt_template_id: MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID,
+        project_code: normalizedCode,
+        category: project.category,
+        input_images: [
+          {
+            ...unifiedInputImage,
+            role: 'material_board_reverse_source',
+            detail: 'Intermediate unified material board generated from company design reference images. It is used only for reverse prompt analysis.',
+          },
+        ],
+      });
+
+      if (reverseResponse.status !== 'success' || !reverseResponse.final_prompt) {
+        const error = new Error(reverseResponse.ai_error?.message || 'AI material board reverse prompt failed.');
+        error.statusCode = 502;
+        error.code = 'EVIDENCE_AGENT_MATERIAL_REVERSE_FAILED';
+        error.retryable = true;
+        throw error;
+      }
+
+      currentRun = await generateAndRecordImage({
+        generateImage,
+        recordResult,
+        dependencies,
+        normalizedCode,
+        request: {
+          prompt: buildMaterialBoardRegenerationPrompt(
+            reverseResponse.final_prompt,
+            sourceLabel,
+            sourceNames,
+          ),
+          project_code: normalizedCode,
+          project_run_id: runId,
+          generation_stage: 'element_image',
+          generation_source: regeneratedSource,
+          generation_label: regeneratedLabel,
+          request_mode: 'images',
+          category: project.category,
+          input_images: [],
+        },
+      }) || currentRun;
+    }
+  }
+
+  return currentRun;
+}
+
+function buildPendingProjectFinalDisplayResult({
+  normalizedCode,
+  publicBaseUrl,
+  run,
+  runId,
+  dataLayer = null,
+  source = 'project_final_display_running',
+  warnings = ['project_final_display_running'],
+} = {}) {
+  const outputRun = generationOutputRun(run) || {};
+  const responseRun = runWithPublicUrls({
+    runId: cleanString(outputRun.runId) || cleanString(runId),
+    projectCode: cleanString(outputRun.projectCode) || normalizedCode,
+    status: cleanString(outputRun.status) || 'running',
+    createdAt: outputRun.createdAt,
+    updatedAt: outputRun.updatedAt,
+    elementImages: Array.isArray(outputRun.elementImages) ? outputRun.elementImages : [],
+    finalDesignImages: Array.isArray(outputRun.finalDesignImages) ? outputRun.finalDesignImages : [],
+  }, publicBaseUrl);
+  return {
+    status: 'pending',
+    source,
+    project: { projectCode: normalizedCode },
+    designReferenceImages: [],
+    run: responseRun,
+    dataLayer,
+    display: buildFinalDisplayView(responseRun, dataLayer),
+    usage: { providerCost: true },
+    warnings,
+  };
+}
+
+function buildBlockedProjectFinalDisplayResult({
+  normalizedCode,
+  publicBaseUrl,
+  project,
+  designReferenceImages = [],
+  run,
+  runId,
+  dataLayer = null,
+  reason,
+  warnings = [],
+} = {}) {
+  const outputRun = generationOutputRun(run) || {};
+  const responseRun = runWithPublicUrls({
+    runId: cleanString(outputRun.runId) || cleanString(runId),
+    projectCode: cleanString(outputRun.projectCode) || normalizedCode,
+    status: 'blocked',
+    createdAt: outputRun.createdAt,
+    updatedAt: outputRun.updatedAt,
+    elementImages: Array.isArray(outputRun.elementImages) ? outputRun.elementImages : [],
+    finalDesignImages: Array.isArray(outputRun.finalDesignImages) ? outputRun.finalDesignImages : [],
+  }, publicBaseUrl);
+  return {
+    status: 'blocked',
+    source: 'project_final_display_blocked',
+    project: project || { projectCode: normalizedCode },
+    designReferenceImages,
+    run: responseRun,
+    dataLayer,
+    display: buildFinalDisplayView(responseRun, dataLayer),
+    usage: { providerCost: true },
+    warnings: [reason, ...warnings].filter(Boolean),
+  };
+}
+
+function activeJobForProject(projectCode) {
+  const job = activeFinalDisplayJobs.get(projectCode);
+  if (!job) return null;
+
+  if (
+    job.status === 'completed' &&
+    Date.now() - Number(job.finishedAt || 0) > COMPLETED_JOB_RESULT_CACHE_MS
+  ) {
+    activeFinalDisplayJobs.delete(projectCode);
+    return null;
+  }
+
+  if (
+    job.status === 'failed' &&
+    job.error?.retryable !== false &&
+    Date.now() - Number(job.finishedAt || 0) > FAILED_JOB_RETRY_DELAY_MS
+  ) {
+    activeFinalDisplayJobs.delete(projectCode);
+    return null;
+  }
+
+  return job;
+}
+
+function scheduleFailedJobCleanup(projectCode, job) {
+  const timeout = setTimeout(() => {
+    if (activeFinalDisplayJobs.get(projectCode) === job) {
+      activeFinalDisplayJobs.delete(projectCode);
+    }
+  }, FAILED_JOB_RETRY_DELAY_MS);
+  timeout.unref?.();
+}
+
+function scheduleCompletedJobCleanup(projectCode, job) {
+  const timeout = setTimeout(() => {
+    if (activeFinalDisplayJobs.get(projectCode) === job) {
+      activeFinalDisplayJobs.delete(projectCode);
+    }
+  }, COMPLETED_JOB_RESULT_CACHE_MS);
+  timeout.unref?.();
+}
+
+function startProjectFinalDisplayJob({
+  normalizedCode,
+  request,
+  dependencies,
+  options,
+  runId,
+}) {
+  const job = {
+    projectCode: normalizedCode,
+    runId,
+    status: 'running',
+    startedAt: Date.now(),
+    finishedAt: 0,
+    error: null,
+  };
+  activeFinalDisplayJobs.set(normalizedCode, job);
+
+  job.promise = generateProjectFinalDisplayNow({
+    normalizedCode,
+    request,
+    dependencies,
+    options: {
+      ...options,
+      runId,
+    },
+  })
+    .then((result) => {
+      job.status = 'completed';
+      job.result = result;
+      job.finishedAt = Date.now();
+      scheduleCompletedJobCleanup(normalizedCode, job);
+      return result;
+    })
+    .catch((error) => {
+      job.status = 'failed';
+      job.error = error;
+      job.finishedAt = Date.now();
+      if (error?.retryable !== false) {
+        scheduleFailedJobCleanup(normalizedCode, job);
+      }
+      return null;
+    });
+
+  return job;
+}
+
+async function generateProjectFinalDisplayNow({
+  normalizedCode,
+  projectCode,
+  request,
+  dependencies = {},
+  options = {},
+} = {}) {
+  const code = normalizedCode || normalizeProjectCode(projectCode);
+  const publicBaseUrl = dependencies.publicBaseUrlFromRequest?.(request) || '';
+  const cachedRun = options.force ? null : latestReusableOutputRunForCode(dependencies, code);
+  if (cachedRun) {
+    const lookupData = cachedRun.projectDataLayer
+      ? null
+      : await lookupProjectDataLayerWithTimeout({
+          normalizedCode: code,
+          request,
+          dependencies,
+        });
+    const dataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
+    if (!cachedRun.projectDataLayer && lookupData?.dataLayer) {
+      recordProjectDataLayerForRun({
+        dependencies,
+        normalizedCode: code,
+        runId: cachedRun.runId,
+        project: lookupData.project,
+        designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+        dataLayer,
+      });
+    }
+    const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
+    return {
+      status: 'completed',
+      source: 'cached_project_final_display',
+      project: cachedRun.project || lookupData?.project || { projectCode: code },
+      designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),
+      run: responseRun,
+      dataLayer,
+      display: buildFinalDisplayView(responseRun, dataLayer),
+      usage: { providerCost: false },
+    };
+  }
+
+  const lookup = await dependencies.prepareProposalFromCompanyLookup({
+    projectCode: code,
+    publicBaseUrl,
+  });
+  if (!lookup?.found) {
+    const error = new Error(lookup?.error_message || 'Project lookup failed.');
+    error.statusCode = lookup?.error_code === 'COMPANY_PROJECT_NOT_FOUND' ? 404 : 502;
+    error.code = lookup?.error_code === 'COMPANY_PROJECT_NOT_FOUND'
+      ? 'EVIDENCE_AGENT_PROJECT_NOT_FOUND'
+      : 'EVIDENCE_AGENT_UPSTREAM_UNAVAILABLE';
+    error.retryable = lookup?.error_code !== 'COMPANY_PROJECT_NOT_FOUND';
+    throw error;
+  }
+
+  const project = projectPreviewFromLookup(lookup);
+  const dataLayer = buildProjectDataLayerFromLookup(lookup);
+  const selectedMaterialImages = selectedMaterialImagesFromLookup(lookup);
+  const designReferenceImages = designReferenceImagesFromLookup(lookup);
+  if (selectedMaterialImages.length === 0 && designReferenceImages.length === 0) {
+    const error = new Error('No material or company design reference image is available for final display generation.');
+    error.statusCode = 422;
+    error.code = 'EVIDENCE_AGENT_NO_DESIGN_REFERENCE_IMAGE';
+    throw error;
+  }
+
+  const resumableRun = options.force ? null : latestOutputRunForCode(dependencies, code);
+  const runId = cleanString(options.runId) || cleanString(resumableRun?.runId) || createRunId(code);
+  recordProjectDataLayerForRun({
+    dependencies,
+    normalizedCode: code,
+    runId,
+    project,
+    designReferenceImages,
+    dataLayer,
+  });
+
+  const generateImage = dependencies.generatePatternImage || generatePatternImage;
+  const composePrompt = dependencies.composeFinalPrompt || composeFinalPrompt;
+  const analyzeShapes = dependencies.analyzeMaterialShapeLevels || analyzeMaterialShapeLevels;
+  const recordResult = dependencies.recordProjectGenerationResult || recordProjectGenerationResult;
+
+  let currentRun = resumableRun;
+  if (selectedMaterialImages.length > 0) {
+    currentRun = await runAgentFlowStep('material', () => generateMaterialOutputs({
+      analyzeShapes,
+      composePrompt,
+      generateImage,
+      recordResult,
+      dependencies,
+      normalizedCode: code,
+      runId,
+      publicBaseUrl,
+      project,
+      sourceImages: selectedMaterialImages,
+      sourceKind: 'material',
+      sourceLabel: 'gallery material',
+      unifiedSource: 'gallery_material_unified_cleanup',
+      splitSource: 'gallery_material_split_cleanup',
+      unifiedLabel: 'Unified gallery material',
+    })) || currentRun;
+  }
+
+  if (designReferenceImages.length > 0) {
+    currentRun = await runAgentFlowStep('reference', () => generateMaterialOutputs({
+      analyzeShapes,
+      composePrompt,
+      generateImage,
+      recordResult,
+      dependencies,
+      normalizedCode: code,
+      runId,
+      publicBaseUrl,
+      project,
+      sourceImages: designReferenceImages,
+      sourceKind: 'design_reference',
+      sourceLabel: designReferenceSourceLabel(designReferenceImages),
+      unifiedSource: 'company_design_reference_unified_split',
+      splitSource: 'company_design_reference_split',
+      unifiedLabel: 'Unified design reference material',
+    })) || currentRun;
+  }
+
+  currentRun = latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun;
+  const currentOutputRun = generationOutputRun(currentRun);
+  const elementImages = sortElementImagesForFinalInput(
+    Array.isArray(currentOutputRun?.elementImages) ? currentOutputRun.elementImages : [],
+  );
+  if (elementImages.length === 0) {
+    const error = new Error('Material image block was not recorded.');
+    error.statusCode = 502;
+    error.code = 'EVIDENCE_AGENT_MATERIAL_RESULT_MISSING';
+    error.retryable = true;
+    throw error;
+  }
+
+  const categoryTargets = categoryTargetsFromLookup(lookup);
+  const finalTargets = (categoryTargets.length > 0
+    ? categoryTargets
+    : [{
+        category: project.category,
+        confidence: 0,
+        reason: '',
+        categoryImage: lookup.category_judgment?.category_image || null,
+      }]
+  ).map((target) => ({
+    ...target,
+    historyImage: historyImageFromCategoryTarget(lookup, target),
+  }));
+  const missingHistoryTargets = finalTargets.filter((target) => !target.historyImage);
+  if (missingHistoryTargets.length > 0) {
+    return buildBlockedProjectFinalDisplayResult({
+      normalizedCode: code,
+      publicBaseUrl,
+      project,
+      designReferenceImages,
+      run: currentRun,
+      runId,
+      dataLayer,
+      reason: 'missing_history_layout_image',
+      warnings: [
+        'Default automatic final-display flow requires a category history layout image before final image generation.',
+        `Missing category history layouts: ${missingHistoryTargets.map((target) => target.category).join(', ')}`,
+      ],
+    });
+  }
+
+  const composedTargets = await runAgentFlowStep('prompt', async () => {
+    const items = [];
+    for (const target of finalTargets) {
+      const targetProject = {
+        ...project,
+        category: target.category || project.category,
+      };
+      const finalInputImages = [
+        target.historyImage,
+        ...imageInputsFromRunImages(elementImages, publicBaseUrl),
+      ];
+      const templatePrompt = buildFinalTemplatePrompt(targetProject, elementImages, true, finalInputImages);
+      const response = await composePrompt({
+        template_prompt: templatePrompt,
+        prompt_template_id: FINAL_DISPLAY_PROMPT_TEMPLATE_ID,
+        project_code: code,
+        category: targetProject.category,
+        input_images: finalInputImages,
+      });
+      if (response.status !== 'success' || !response.final_prompt) {
+        const error = new Error(response.ai_error?.message || `AI final prompt composition failed: ${response.status}`);
+        error.statusCode = 502;
+        error.code = 'EVIDENCE_AGENT_FINAL_PROMPT_FAILED';
+        error.retryable = response.status !== 'missing_config';
+        throw error;
+      }
+      items.push({
+        target,
+        inputImages: finalInputImages,
+        composed: response,
+      });
+    }
+    return items;
+  });
+  currentRun = await runAgentFlowStep('generate', async () => {
+    let runAfterGeneration = latestOutputRunForCode(dependencies, code) || currentRun;
+    for (const item of composedTargets) {
+      const generationLabel = `Final generated design - ${item.target.category}`;
+      const finalRequest = {
+        prompt: item.composed.final_prompt,
+        project_code: code,
+        project_run_id: runId,
+        generation_stage: 'final_design',
+        generation_source: FINAL_DISPLAY_FINAL_GENERATION_SOURCE,
+        generation_label: generationLabel,
+        category: item.target.category,
+        history_layout_lock_policy: item.composed.history_layout_lock_policy || 'layout_lock',
+        history_layout_lock_reason: item.composed.history_layout_lock_reason || '',
+        input_images: item.inputImages,
+      };
+      const latestOutputRun = latestOutputRunForCode(dependencies, code) || runAfterGeneration;
+      if (!hasRecordedImageForRequest(
+        latestOutputRun,
+        'finalDesignImages',
+        finalRequest.generation_source,
+        finalRequest.generation_label,
+      )) {
+        runAfterGeneration = await generateAndRecordImage({
+          generateImage,
+          recordResult,
+          dependencies,
+          normalizedCode: code,
+          request: finalRequest,
+        }) || runAfterGeneration;
+      }
+    }
+    return runAfterGeneration;
+  }) || currentRun;
+
+  const run = generationOutputRun(latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun);
+  const responseRun = runWithPublicUrls(run, publicBaseUrl);
+  return {
+    status: 'completed',
+    source: 'generated_project_final_display',
+    project,
+    designReferenceImages,
+    run: responseRun,
+    dataLayer,
+    display: buildFinalDisplayView(responseRun, dataLayer),
+    usage: { providerCost: true },
+  };
+}
+
+async function prepareProjectFinalDisplay({
+  projectCode,
+  request,
+  dependencies = {},
+  options = {},
+} = {}) {
+  const normalizedCode = normalizeProjectCode(projectCode);
+  if (!normalizedCode) {
+    const error = new Error('Invalid YXF project code.');
+    error.statusCode = 400;
+    error.code = 'EVIDENCE_AGENT_INVALID_PROJECT_CODE';
+    throw error;
+  }
+
+  const publicBaseUrl = dependencies.publicBaseUrlFromRequest?.(request) || '';
+  const activeJob = options.force ? null : activeJobForProject(normalizedCode);
+  if (activeJob) {
+    if (activeJob.status === 'failed') {
+      throw activeJob.error;
+    }
+
+    if (activeJob.status === 'completed' && activeJob.result) {
+      return activeJob.result;
+    }
+
+    const currentRun = latestOutputRunForCode(dependencies, normalizedCode) ||
+      latestProjectRunForCode(dependencies, normalizedCode);
+    return buildPendingProjectFinalDisplayResult({
+      normalizedCode,
+      publicBaseUrl,
+      run: currentRun,
+      runId: activeJob.runId,
+      dataLayer: null,
+      source: 'project_final_display_running',
+    });
+  }
+
+  const cachedRun = options.force ? null : latestReusableOutputRunForCode(dependencies, normalizedCode);
+  if (cachedRun) {
+    const lookupData = cachedRun.projectDataLayer || options.synchronous === true
+      ? null
+      : await lookupProjectDataLayerWithTimeout({ normalizedCode, request, dependencies });
+    const dataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
+    if (!cachedRun.projectDataLayer && lookupData?.dataLayer) {
+      recordProjectDataLayerForRun({
+        dependencies,
+        normalizedCode,
+        runId: cachedRun.runId,
+        project: lookupData.project,
+        designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+        dataLayer,
+      });
+    }
+    const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
+    return {
+      status: 'completed',
+      source: 'cached_project_final_display',
+      project: cachedRun.project || lookupData?.project || { projectCode: normalizedCode },
+      designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),
+      run: responseRun,
+      dataLayer,
+      display: buildFinalDisplayView(responseRun, dataLayer),
+      usage: { providerCost: false },
+    };
+  }
+
+  if (options.synchronous === true) {
+    return generateProjectFinalDisplayNow({
+      normalizedCode,
+      request,
+      dependencies,
+      options,
+    });
+  }
+
+  const partialRun = options.force ? null : latestOutputRunForCode(dependencies, normalizedCode);
+  const runId = cleanString(options.runId) || cleanString(partialRun?.runId) || createRunId(normalizedCode);
+  const lookupData = partialRun?.projectDataLayer
+    ? null
+    : await lookupProjectDataLayerWithTimeout({ normalizedCode, request, dependencies }, 5000);
+  const dataLayer = partialRun?.projectDataLayer || lookupData?.dataLayer || null;
+  if (!partialRun?.projectDataLayer && lookupData?.dataLayer) {
+    recordProjectDataLayerForRun({
+      dependencies,
+      normalizedCode,
+      runId,
+      project: lookupData.project,
+      designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+      dataLayer,
+    });
+  }
+
+  startProjectFinalDisplayJob({
+    normalizedCode,
+    request,
+    dependencies,
+    options,
+    runId,
+  });
+
+  return buildPendingProjectFinalDisplayResult({
+    normalizedCode,
+    publicBaseUrl,
+    run: partialRun,
+    runId,
+    dataLayer,
+    source: partialRun ? 'project_final_display_resuming' : 'project_final_display_started',
+  });
+}
+
+module.exports = {
+  buildFallbackFinalPrompt,
+  buildFinalTemplatePrompt,
+  buildMaterialProcessingPrompt,
+  prepareProjectFinalDisplay,
+};

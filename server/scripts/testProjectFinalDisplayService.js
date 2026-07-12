@@ -7,6 +7,7 @@ const {
   getProjectRunsForCode,
   recordProjectGenerationResult,
   recordProjectRunMetadata,
+  recordProjectRunProgress,
 } = require('../services/projectRunStore');
 const { prepareProjectFinalDisplay } = require('../services/projectFinalDisplayService');
 
@@ -91,6 +92,7 @@ async function main() {
 
   const generatedCalls = [];
   const composeCalls = [];
+  const providerTimeouts = [];
   const generated = await prepareProjectFinalDisplay({
     projectCode: 'YXF2511160005',
     request: {},
@@ -100,6 +102,9 @@ async function main() {
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
       recordProjectRunMetadata: (request, metadata) => recordProjectRunMetadata(request, metadata, storeOptions),
+      recordProjectRunProgress: (request, progress) => recordProjectRunProgress(request, progress, storeOptions),
+      finalDisplayJobTimeoutMs: 10000,
+      finalDisplayAiCallTimeoutMs: 5000,
       prepareProposalFromCompanyLookup: async ({ projectCode }) => ({
         found: true,
         project_code: projectCode,
@@ -152,7 +157,8 @@ async function main() {
           history_layout_lock_reason: 'test',
         }),
       }),
-      generatePatternImage: async (request) => {
+      generatePatternImage: async (request, providerOptions) => {
+        providerTimeouts.push(providerOptions?.timeoutMs);
         generatedCalls.push({
           stage: request.generation_stage,
           source: request.generation_source,
@@ -190,8 +196,12 @@ async function main() {
   assert.strictEqual(generated.display.projectDataLayer.sections.designReferenceImages.count, 1);
   assert.deepStrictEqual(generated.display.projectDataLayer.sections.textElements.visible, ['CLEVELAND']);
   const generatedStoredRun = getLatestProjectRunForCode('YXF2511160005', storeOptions);
+  assert.strictEqual(generatedStoredRun.status, 'completed');
+  assert.strictEqual(generatedStoredRun.progress.stage, 'project_final_display');
+  assert.strictEqual(generatedStoredRun.progress.status, 'success');
   assert.strictEqual(generatedStoredRun.projectDataLayer.sections.designReferenceImages.count, 1);
   assert.deepStrictEqual(generatedStoredRun.projectDataLayer.sections.textElements.visible, ['CLEVELAND']);
+  assert(providerTimeouts.every((timeoutMs) => timeoutMs > 0 && timeoutMs <= 5000));
   assert.strictEqual(generatedCalls.length, 7);
   assert.deepStrictEqual(generatedCalls.map((call) => call.source), [
     'gallery_material_split_cleanup',
@@ -229,6 +239,7 @@ async function main() {
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
       recordProjectRunMetadata: (request, metadata) => recordProjectRunMetadata(request, metadata, storeOptions),
+      recordProjectRunProgress: (request, progress) => recordProjectRunProgress(request, progress, storeOptions),
       prepareProposalFromCompanyLookup: async ({ projectCode }) => ({
         found: true,
         project_code: projectCode,
@@ -337,12 +348,16 @@ async function main() {
   ]);
 
   const asyncCalls = [];
+  let activeAsyncGenerations = 0;
+  let maxActiveAsyncGenerations = 0;
   const asyncDependencies = {
     publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+    finalDisplayRetryBaseDelayMs: 1,
     getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
     getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
     recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
     recordProjectRunMetadata: (request, metadata) => recordProjectRunMetadata(request, metadata, storeOptions),
+    recordProjectRunProgress: (request, progress) => recordProjectRunProgress(request, progress, storeOptions),
     prepareProposalFromCompanyLookup: async ({ projectCode }) => ({
       found: true,
       project_code: projectCode,
@@ -391,18 +406,24 @@ async function main() {
         source: request.generation_source,
         runId: request.project_run_id,
       });
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      return {
-        status: 'success',
-        source: 'ai_image_generator',
-        model: 'gpt-image-2',
-        request_mode: request.request_mode || 'edits',
-        input_image_count: request.input_images.length,
-        images: [{
-          b64_json: Buffer.from(`${request.generation_stage}:${request.generation_source}:${asyncCalls.length}`).toString('base64'),
-          mime_type: 'image/png',
-        }],
-      };
+      activeAsyncGenerations += 1;
+      maxActiveAsyncGenerations = Math.max(maxActiveAsyncGenerations, activeAsyncGenerations);
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return {
+          status: 'success',
+          source: 'ai_image_generator',
+          model: 'gpt-image-2',
+          request_mode: request.request_mode || 'edits',
+          input_image_count: request.input_images.length,
+          images: [{
+            b64_json: Buffer.from(`${request.generation_stage}:${request.generation_source}:${request.generation_label}`).toString('base64'),
+            mime_type: 'image/png',
+          }],
+        };
+      } finally {
+        activeAsyncGenerations -= 1;
+      }
     },
   };
 
@@ -432,16 +453,116 @@ async function main() {
   }
 
   assert(completed, 'background final-display job should complete while callers poll');
+  assert.strictEqual(completed.run.status, 'completed');
+  assert.strictEqual(completed.run.progress.stage, 'project_final_display');
+  assert.strictEqual(completed.run.progress.status, 'success');
   assert.strictEqual(completed.run.elementImages.length, 3);
   assert.strictEqual(completed.run.finalDesignImages.length, 1);
   assert.strictEqual(completed.display.projectDataLayer.sections.designReferenceImages.count, 1);
   assert.strictEqual(new Set(asyncCalls.map((call) => call.runId)).size, 1);
+  assert.strictEqual(maxActiveAsyncGenerations, 2);
   assert.deepStrictEqual(asyncCalls.map((call) => call.source), [
     'company_design_reference_split',
     'company_design_reference_split',
     'company_design_reference_split',
     'automated_flow_final_generation',
   ]);
+
+  let failedAnalysisAttempts = 0;
+  const failingDependencies = {
+    ...asyncDependencies,
+    analyzeMaterialShapeLevels: async () => {
+      failedAnalysisAttempts += 1;
+      const error = new Error('temporary analyzer failure');
+      error.code = 'EVIDENCE_AGENT_MATERIAL_SHAPE_ANALYSIS_FAILED';
+      error.retryable = true;
+      throw error;
+    },
+  };
+  const pendingFailure = await prepareProjectFinalDisplay({
+    projectCode: 'YXF2511160009',
+    request: {},
+    dependencies: failingDependencies,
+  });
+  assert.strictEqual(pendingFailure.status, 'pending');
+
+  let terminalFailure = null;
+  for (let index = 0; index < 40; index += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    try {
+      await prepareProjectFinalDisplay({
+        projectCode: 'YXF2511160009',
+        request: {},
+        dependencies: failingDependencies,
+      });
+    } catch (error) {
+      terminalFailure = error;
+      break;
+    }
+  }
+
+  assert(terminalFailure, 'failed background job should return a terminal error to polling callers');
+  assert.strictEqual(terminalFailure.retryable, false);
+  assert.strictEqual(failedAnalysisAttempts, 3);
+  const persistedFailure = getLatestProjectRunForCode('YXF2511160009', storeOptions);
+  assert.strictEqual(persistedFailure.status, 'failed');
+  assert.strictEqual(persistedFailure.progress.stage, 'reference');
+  assert.strictEqual(persistedFailure.progress.status, 'failed');
+  assert.strictEqual(persistedFailure.error.retryable, false);
+
+  await assert.rejects(
+    () => prepareProjectFinalDisplay({
+      projectCode: 'YXF2511160009',
+      request: {},
+      dependencies: failingDependencies,
+    }),
+    (error) => error === terminalFailure,
+  );
+  assert.strictEqual(failedAnalysisAttempts, 3, 'polling must not recreate a terminally failed job');
+
+  const persistedFailureRunId = 'prun-YXF2511160010-final-display-persisted';
+  recordProjectRunProgress({
+    project_code: 'YXF2511160010',
+    project_run_id: persistedFailureRunId,
+    request_id: 'persisted-request-id',
+  }, {
+    stage: 'generate',
+    status: 'failed',
+    runStatus: 'failed',
+    attempt: 3,
+    maxAttempts: 3,
+    error: {
+      code: 'EVIDENCE_AGENT_FINAL_GENERATION_FAILED',
+      retryable: false,
+    },
+  }, storeOptions);
+  let persistedFailureLookupCalls = 0;
+  const persistedFailureDependencies = {
+    getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
+    getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
+    prepareProposalFromCompanyLookup: async () => {
+      persistedFailureLookupCalls += 1;
+      throw new Error('terminal persisted runs must not restart provider work');
+    },
+  };
+  await assert.rejects(
+    () => prepareProjectFinalDisplay({
+      projectCode: 'YXF2511160010',
+      request: { body: { requestId: 'persisted-request-id' } },
+      dependencies: persistedFailureDependencies,
+      options: { runId: persistedFailureRunId },
+    }),
+    (error) => error.code === 'EVIDENCE_AGENT_FINAL_GENERATION_FAILED' && error.retryable === false,
+  );
+  await assert.rejects(
+    () => prepareProjectFinalDisplay({
+      projectCode: 'YXF2511160010',
+      request: { body: { requestId: 'persisted-request-id' } },
+      dependencies: persistedFailureDependencies,
+    }),
+    (error) => error.code === 'EVIDENCE_AGENT_FINAL_GENERATION_FAILED' && error.retryable === false,
+  );
+  assert.strictEqual(persistedFailureLookupCalls, 0);
 
   const comboGenerateCalls = [];
   const comboComposeCalls = [];
@@ -454,6 +575,7 @@ async function main() {
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
       recordProjectRunMetadata: (request, metadata) => recordProjectRunMetadata(request, metadata, storeOptions),
+      recordProjectRunProgress: (request, progress) => recordProjectRunProgress(request, progress, storeOptions),
       prepareProposalFromCompanyLookup: async () => ({
         found: true,
         project_code: 'YXF2511160008',

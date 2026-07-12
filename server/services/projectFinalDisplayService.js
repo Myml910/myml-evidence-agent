@@ -1,11 +1,21 @@
 const crypto = require('crypto');
-const { composeFinalPrompt } = require('./aiFinalPromptComposer');
-const { generatePatternImage } = require('./aiImageGenerator');
-const { analyzeMaterialShapeLevels } = require('./aiMaterialShapeAnalyzer');
+const {
+  composeFinalPrompt,
+  getAiFinalPromptComposerConfig,
+} = require('./aiFinalPromptComposer');
+const {
+  generatePatternImage,
+  getAiImageGeneratorConfig,
+} = require('./aiImageGenerator');
+const {
+  analyzeMaterialShapeLevels,
+  getAiMaterialShapeAnalyzerConfig,
+} = require('./aiMaterialShapeAnalyzer');
 const {
   getLatestProjectRunForCode,
   getProjectRunsForCode,
   recordProjectRunMetadata,
+  recordProjectRunProgress,
   recordProjectGenerationResult,
 } = require('./projectRunStore');
 
@@ -56,13 +66,188 @@ const ACCEPTED_FINAL_SOURCES = new Set([
   FINAL_DISPLAY_FINAL_GENERATION_SOURCE,
   'manual_final_generation',
 ]);
-const FAILED_JOB_RETRY_DELAY_MS = 60 * 1000;
+const DEFAULT_FAILED_JOB_RESULT_CACHE_MS = 5 * 60 * 1000;
+const DEFAULT_FINAL_DISPLAY_AI_MAX_CONCURRENCY = 8;
+const DEFAULT_FINAL_DISPLAY_STAGE_CONCURRENCY = 2;
+const DEFAULT_FINAL_DISPLAY_JOB_TIMEOUT_MS = 28 * 60 * 1000;
+const DEFAULT_FINAL_DISPLAY_AI_CALL_TIMEOUT_MS = 10 * 60 * 1000;
+const DEFAULT_FINAL_DISPLAY_RETRY_BASE_DELAY_MS = 2 * 1000;
 const COMPLETED_JOB_RESULT_CACHE_MS = 30 * 60 * 1000;
 const PROJECT_DATA_LAYER_LOOKUP_TIMEOUT_MS = 20 * 1000;
 const activeFinalDisplayJobs = new Map();
 
+function positiveInteger(value, fallback) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const FAILED_JOB_RESULT_CACHE_MS = positiveInteger(
+  process.env.FINAL_DISPLAY_FAILED_JOB_CACHE_MS,
+  DEFAULT_FAILED_JOB_RESULT_CACHE_MS,
+);
+const FINAL_DISPLAY_AI_MAX_CONCURRENCY = positiveInteger(
+  process.env.FINAL_DISPLAY_AI_MAX_CONCURRENCY,
+  DEFAULT_FINAL_DISPLAY_AI_MAX_CONCURRENCY,
+);
+const FINAL_DISPLAY_STAGE_CONCURRENCY = positiveInteger(
+  process.env.FINAL_DISPLAY_STAGE_CONCURRENCY,
+  DEFAULT_FINAL_DISPLAY_STAGE_CONCURRENCY,
+);
+const FINAL_DISPLAY_JOB_TIMEOUT_MS = positiveInteger(
+  process.env.FINAL_DISPLAY_JOB_TIMEOUT_MS,
+  DEFAULT_FINAL_DISPLAY_JOB_TIMEOUT_MS,
+);
+const FINAL_DISPLAY_AI_CALL_TIMEOUT_MS = positiveInteger(
+  process.env.FINAL_DISPLAY_AI_CALL_TIMEOUT_MS,
+  DEFAULT_FINAL_DISPLAY_AI_CALL_TIMEOUT_MS,
+);
+const FINAL_DISPLAY_RETRY_BASE_DELAY_MS = positiveInteger(
+  process.env.FINAL_DISPLAY_RETRY_BASE_DELAY_MS,
+  DEFAULT_FINAL_DISPLAY_RETRY_BASE_DELAY_MS,
+);
+
+function finalDisplayTimeoutError(stage = 'project_final_display') {
+  const error = new Error('Project final display generation exceeded its execution deadline.');
+  error.statusCode = 504;
+  error.code = 'EVIDENCE_AGENT_FINAL_DISPLAY_TIMEOUT';
+  error.retryable = false;
+  error.stepName = stage;
+  return error;
+}
+
+function createAsyncGate(limit) {
+  let active = 0;
+  const waiting = [];
+
+  function grantNext() {
+    while (waiting.length > 0) {
+      const entry = waiting.shift();
+      if (entry.cancelled) continue;
+      entry.granted = true;
+      clearTimeout(entry.timeout);
+      active += 1;
+      entry.resolve();
+      return;
+    }
+  }
+
+  async function acquire(deadlineAt) {
+    if (active < limit) {
+      active += 1;
+      return;
+    }
+
+    await new Promise((resolve, reject) => {
+      const entry = {
+        cancelled: false,
+        granted: false,
+        resolve,
+        timeout: null,
+      };
+      const remainingMs = Number(deadlineAt) - Date.now();
+      if (Number.isFinite(remainingMs)) {
+        if (remainingMs <= 0) {
+          reject(finalDisplayTimeoutError());
+          return;
+        }
+        entry.timeout = setTimeout(() => {
+          if (entry.granted) return;
+          entry.cancelled = true;
+          reject(finalDisplayTimeoutError());
+        }, remainingMs);
+        entry.timeout.unref?.();
+      }
+      waiting.push(entry);
+    });
+  }
+
+  return async function runWithGate(action, options = {}) {
+    await acquire(options.deadlineAt);
+    try {
+      if (Number.isFinite(Number(options.deadlineAt)) && Date.now() >= Number(options.deadlineAt)) {
+        throw finalDisplayTimeoutError();
+      }
+      return await action();
+    } finally {
+      active -= 1;
+      grantNext();
+    }
+  };
+}
+
+const runWithFinalDisplayAiPermit = createAsyncGate(FINAL_DISPLAY_AI_MAX_CONCURRENCY);
+
+function createFinalDisplayJobDeadline(dependencies = {}) {
+  return Date.now() + positiveInteger(
+    dependencies.finalDisplayJobTimeoutMs,
+    FINAL_DISPLAY_JOB_TIMEOUT_MS,
+  );
+}
+
+function deadlineBoundProviderOptions({
+  deadlineAt,
+  envKey,
+  configuredTimeoutMs,
+  maxCallTimeoutMs,
+  stage,
+}) {
+  const remainingMs = Number(deadlineAt) - Date.now();
+  if (!Number.isFinite(remainingMs) || remainingMs <= 0) {
+    throw finalDisplayTimeoutError(stage);
+  }
+
+  const timeoutMs = Math.max(1, Math.min(
+    positiveInteger(configuredTimeoutMs, maxCallTimeoutMs),
+    positiveInteger(maxCallTimeoutMs, FINAL_DISPLAY_AI_CALL_TIMEOUT_MS),
+    remainingMs,
+  ));
+  return {
+    deadlineAt,
+    timeoutMs,
+    env: {
+      ...process.env,
+      [envKey]: String(timeoutMs),
+    },
+  };
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const source = Array.isArray(items) ? items : [];
+  if (source.length === 0) return [];
+
+  const results = new Array(source.length);
+  let nextIndex = 0;
+  let firstError = null;
+  const workers = Array.from(
+    { length: Math.min(positiveInteger(limit, 1), source.length) },
+    async () => {
+      while (nextIndex < source.length && !firstError) {
+        const index = nextIndex;
+        nextIndex += 1;
+        try {
+          results[index] = await mapper(source[index], index);
+        } catch (error) {
+          firstError = firstError || error;
+        }
+      }
+    },
+  );
+  await Promise.all(workers);
+  if (firstError) throw firstError;
+  return results;
+}
+
 function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
+}
+
+function finalDisplayRequestId(request) {
+  return cleanString(
+    request?.body?.requestId ||
+    request?.body?.request_id ||
+    request?.headers?.['x-myml-request-id'] ||
+    request?.get?.('x-myml-request-id'),
+  );
 }
 
 function normalizeProjectCode(value) {
@@ -878,7 +1063,9 @@ function isProjectFinalDisplayRunId(value) {
 
 function isReusableFinalDisplayRun(run) {
   const runId = cleanString(run?.runId);
-  return isProjectFinalDisplayRunId(runId) && hasDisplayRun(generationOutputRun(run));
+  return isProjectFinalDisplayRunId(runId) &&
+    cleanString(run?.status) === 'completed' &&
+    hasDisplayRun(generationOutputRun(run));
 }
 
 function isPartialFinalDisplayRun(run) {
@@ -896,6 +1083,25 @@ function getProjectRunsForCodeFromDependencies(dependencies, projectCode) {
   }
 
   return getProjectRunsForCode(projectCode);
+}
+
+function projectRunById(dependencies, projectCode, runId) {
+  const requestedRunId = cleanString(runId);
+  if (!requestedRunId) return null;
+  return getProjectRunsForCodeFromDependencies(dependencies, projectCode)
+    .find((run) => cleanString(run?.runId) === requestedRunId) || null;
+}
+
+function terminalProjectRunError(run) {
+  const code = cleanString(run?.error?.code) || 'EVIDENCE_AGENT_FINAL_DISPLAY_FAILED';
+  const error = new Error('Project final display generation reached a terminal failure. Submit a new request to retry.');
+  error.statusCode = code === 'EVIDENCE_AGENT_FINAL_DISPLAY_TIMEOUT' ? 504 : 502;
+  error.code = code;
+  error.retryable = false;
+  error.stepName = cleanString(run?.error?.stage || run?.progress?.stage) || 'project_final_display';
+  error.attempt = Number(run?.progress?.attempt) || 1;
+  error.maxAttempts = Number(run?.progress?.maxAttempts) || AGENT_FLOW_MAX_RETRIES;
+  return error;
 }
 
 function latestReusableOutputRunForCode(dependencies, projectCode) {
@@ -925,16 +1131,120 @@ function latestProjectRunForCode(dependencies, projectCode) {
   return getLatestProjectRunForCode(projectCode);
 }
 
-async function runAgentFlowStep(stepName, action) {
+function resolveProgressRecorder(dependencies = {}) {
+  if (typeof dependencies.recordProjectRunProgress === 'function') {
+    return dependencies.recordProjectRunProgress;
+  }
+  if (typeof dependencies.projectRunStore?.recordProjectRunProgress === 'function') {
+    return dependencies.projectRunStore.recordProjectRunProgress;
+  }
+
+  const hasCustomRunStore = [
+    dependencies.recordProjectGenerationResult,
+    dependencies.recordProjectRunMetadata,
+    dependencies.getProjectRunsForCode,
+    dependencies.getLatestProjectRunForCode,
+    dependencies.projectRunStore,
+  ].some(Boolean);
+  return hasCustomRunStore ? null : recordProjectRunProgress;
+}
+
+function createProgressReporter(dependencies, projectCode, runId, requestId = '') {
+  const recorder = resolveProgressRecorder(dependencies);
+  if (!recorder) return async () => {};
+
+  return async (progress) => {
+    try {
+      return recorder({
+        project_code: projectCode,
+        project_run_id: runId,
+        request_id: requestId,
+      }, progress);
+    } catch (_error) {
+      return null;
+    }
+  };
+}
+
+async function emitStepProgress(onProgress, payload) {
+  if (typeof onProgress !== 'function') return;
+  try {
+    await onProgress(payload);
+  } catch (_error) {
+    // Progress persistence must not turn a successful provider call into a failed job.
+  }
+}
+
+async function waitForStepRetry(attempt, options = {}) {
+  const baseDelayMs = positiveInteger(
+    options.retryBaseDelayMs,
+    FINAL_DISPLAY_RETRY_BASE_DELAY_MS,
+  );
+  const delayMs = baseDelayMs * (2 ** Math.max(0, attempt - 1));
+  const deadlineAt = Number(options.deadlineAt);
+  if (Number.isFinite(deadlineAt) && Date.now() + delayMs >= deadlineAt) {
+    const error = finalDisplayTimeoutError(options.stepName);
+    error.attempt = attempt;
+    error.maxAttempts = AGENT_FLOW_MAX_RETRIES;
+    throw error;
+  }
+  await new Promise((resolve) => {
+    setTimeout(resolve, delayMs);
+  });
+}
+
+async function runAgentFlowStep(stepName, action, options = {}) {
   let lastError = null;
   for (let attempt = 1; attempt <= AGENT_FLOW_MAX_RETRIES; attempt += 1) {
+    const startedAt = Date.now();
+    await emitStepProgress(options.onProgress, {
+      stage: stepName,
+      status: 'started',
+      runStatus: 'running',
+      attempt,
+      maxAttempts: AGENT_FLOW_MAX_RETRIES,
+    });
+
     try {
-      return await action(attempt);
+      const result = await action(attempt);
+      await emitStepProgress(options.onProgress, {
+        stage: stepName,
+        status: 'success',
+        runStatus: 'running',
+        attempt,
+        maxAttempts: AGENT_FLOW_MAX_RETRIES,
+        durationMs: Date.now() - startedAt,
+      });
+      return result;
     } catch (error) {
       lastError = error instanceof Error ? error : new Error(String(error));
-      if (lastError.retryable === false) {
+      lastError.stepName = stepName;
+      lastError.attempt = attempt;
+      lastError.maxAttempts = AGENT_FLOW_MAX_RETRIES;
+      const exhausted = attempt >= AGENT_FLOW_MAX_RETRIES;
+      const terminal = lastError.retryable === false || exhausted;
+      if (terminal) {
+        lastError.retryable = false;
+      }
+      await emitStepProgress(options.onProgress, {
+        stage: stepName,
+        status: terminal ? 'failed' : 'retrying',
+        runStatus: terminal ? 'failed' : 'running',
+        attempt,
+        maxAttempts: AGENT_FLOW_MAX_RETRIES,
+        durationMs: Date.now() - startedAt,
+        error: {
+          code: lastError.code || 'EVIDENCE_AGENT_FINAL_DISPLAY_FAILED',
+          retryable: !terminal,
+        },
+      });
+      if (terminal) {
         throw lastError;
       }
+      await waitForStepRetry(attempt, {
+        ...options,
+        stepName,
+      });
     }
   }
 
@@ -1045,6 +1355,7 @@ async function generateMaterialOutputs({
   unifiedSource,
   splitSource,
   unifiedLabel,
+  stageConcurrency = FINAL_DISPLAY_STAGE_CONCURRENCY,
 }) {
   if (!Array.isArray(sourceImages) || sourceImages.length === 0) {
     return latestProjectRunForCode(dependencies, normalizedCode);
@@ -1065,6 +1376,42 @@ async function generateMaterialOutputs({
   const levels = splitRequired ? MATERIAL_SHAPE_LEVELS : [null];
 
   let currentRun = latestProjectRunForCode(dependencies, normalizedCode);
+  if (splitRequired) {
+    const generatedRuns = await mapWithConcurrency(levels, stageConcurrency, async (shapeLevel) => {
+      const generationLabel = `${sourceLabel} ${shapeLevel.label}`;
+      const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
+      if (hasRecordedImageForRequest(rawRun, 'elementImages', splitSource, generationLabel)) {
+        return rawRun;
+      }
+
+      return generateAndRecordImage({
+        generateImage,
+        recordResult,
+        dependencies,
+        normalizedCode,
+        request: {
+          prompt: buildMaterialProcessingPrompt({
+            sourceLabel,
+            project,
+            shapeLevel,
+            shapeAnalysis,
+          }),
+          project_code: normalizedCode,
+          project_run_id: runId,
+          generation_stage: 'element_image',
+          generation_source: splitSource,
+          generation_label: generationLabel,
+          category: project.category,
+          input_images: inputImages,
+        },
+      });
+    });
+
+    return latestProjectRunForCode(dependencies, normalizedCode) ||
+      generatedRuns.filter(Boolean).at(-1) ||
+      currentRun;
+  }
+
   for (const shapeLevel of levels) {
     const generationSource = shapeLevel ? splitSource : unifiedSource;
     const generationLabel = shapeLevel ? `${sourceLabel} ${shapeLevel.label}` : unifiedLabel;
@@ -1200,6 +1547,8 @@ function buildPendingProjectFinalDisplayResult({
     updatedAt: outputRun.updatedAt,
     elementImages: Array.isArray(outputRun.elementImages) ? outputRun.elementImages : [],
     finalDesignImages: Array.isArray(outputRun.finalDesignImages) ? outputRun.finalDesignImages : [],
+    progress: outputRun.progress || null,
+    error: outputRun.error || null,
   }, publicBaseUrl);
   return {
     status: 'pending',
@@ -1234,6 +1583,8 @@ function buildBlockedProjectFinalDisplayResult({
     updatedAt: outputRun.updatedAt,
     elementImages: Array.isArray(outputRun.elementImages) ? outputRun.elementImages : [],
     finalDesignImages: Array.isArray(outputRun.finalDesignImages) ? outputRun.finalDesignImages : [],
+    progress: outputRun.progress || null,
+    error: outputRun.error || null,
   }, publicBaseUrl);
   return {
     status: 'blocked',
@@ -1262,8 +1613,7 @@ function activeJobForProject(projectCode) {
 
   if (
     job.status === 'failed' &&
-    job.error?.retryable !== false &&
-    Date.now() - Number(job.finishedAt || 0) > FAILED_JOB_RETRY_DELAY_MS
+    Date.now() - Number(job.finishedAt || 0) > FAILED_JOB_RESULT_CACHE_MS
   ) {
     activeFinalDisplayJobs.delete(projectCode);
     return null;
@@ -1277,7 +1627,7 @@ function scheduleFailedJobCleanup(projectCode, job) {
     if (activeFinalDisplayJobs.get(projectCode) === job) {
       activeFinalDisplayJobs.delete(projectCode);
     }
-  }, FAILED_JOB_RETRY_DELAY_MS);
+  }, FAILED_JOB_RESULT_CACHE_MS);
   timeout.unref?.();
 }
 
@@ -1300,12 +1650,27 @@ function startProjectFinalDisplayJob({
   const job = {
     projectCode: normalizedCode,
     runId,
+    requestId: finalDisplayRequestId(request),
     status: 'running',
     startedAt: Date.now(),
+    deadlineAt: createFinalDisplayJobDeadline(dependencies),
     finishedAt: 0,
     error: null,
   };
   activeFinalDisplayJobs.set(normalizedCode, job);
+  const reportProgress = createProgressReporter(
+    dependencies,
+    normalizedCode,
+    runId,
+    job.requestId,
+  );
+  void reportProgress({
+    stage: 'project_final_display',
+    status: 'started',
+    runStatus: 'running',
+    attempt: 1,
+    maxAttempts: 1,
+  });
 
   job.promise = generateProjectFinalDisplayNow({
     normalizedCode,
@@ -1314,22 +1679,51 @@ function startProjectFinalDisplayJob({
     options: {
       ...options,
       runId,
+      jobDeadlineAt: job.deadlineAt,
     },
-  })
-    .then((result) => {
-      job.status = 'completed';
-      job.result = result;
-      job.finishedAt = Date.now();
-      scheduleCompletedJobCleanup(normalizedCode, job);
-      return result;
     })
-    .catch((error) => {
+    .then(async (result) => {
+      job.finishedAt = Date.now();
+      const blocked = result?.status === 'blocked';
+      await reportProgress({
+        stage: 'project_final_display',
+        status: blocked ? 'blocked' : 'success',
+        runStatus: blocked ? 'blocked' : 'completed',
+        attempt: 1,
+        maxAttempts: 1,
+        durationMs: job.finishedAt - job.startedAt,
+      });
+      const persistedRun = latestOutputRunForCode(dependencies, normalizedCode);
+      const publicBaseUrl = dependencies.publicBaseUrlFromRequest?.(request) || '';
+      const completedResult = persistedRun
+        ? {
+            ...result,
+            run: runWithPublicUrls(persistedRun, publicBaseUrl),
+            display: buildFinalDisplayView(runWithPublicUrls(persistedRun, publicBaseUrl), result.dataLayer),
+          }
+        : result;
+      job.status = 'completed';
+      job.result = completedResult;
+      scheduleCompletedJobCleanup(normalizedCode, job);
+      return completedResult;
+    })
+    .catch(async (error) => {
+      job.finishedAt = Date.now();
+      await reportProgress({
+        stage: error?.stepName || 'project_final_display',
+        status: 'failed',
+        runStatus: 'failed',
+        attempt: Number(error?.attempt) || 1,
+        maxAttempts: Number(error?.maxAttempts) || AGENT_FLOW_MAX_RETRIES,
+        durationMs: job.finishedAt - job.startedAt,
+        error: {
+          code: error?.code || 'EVIDENCE_AGENT_FINAL_DISPLAY_FAILED',
+          retryable: false,
+        },
+      });
       job.status = 'failed';
       job.error = error;
-      job.finishedAt = Date.now();
-      if (error?.retryable !== false) {
-        scheduleFailedJobCleanup(normalizedCode, job);
-      }
+      scheduleFailedJobCleanup(normalizedCode, job);
       return null;
     });
 
@@ -1378,10 +1772,28 @@ async function generateProjectFinalDisplayNow({
     };
   }
 
-  const lookup = await dependencies.prepareProposalFromCompanyLookup({
+  const resumableRun = options.force ? null : latestOutputRunForCode(dependencies, code);
+  const runId = cleanString(options.runId) || cleanString(resumableRun?.runId) || createRunId(code);
+  const reportProgress = createProgressReporter(
+    dependencies,
+    code,
+    runId,
+    finalDisplayRequestId(request),
+  );
+  const jobDeadlineAt = Number(options.jobDeadlineAt) || createFinalDisplayJobDeadline(dependencies);
+  const maxCallTimeoutMs = positiveInteger(
+    dependencies.finalDisplayAiCallTimeoutMs,
+    FINAL_DISPLAY_AI_CALL_TIMEOUT_MS,
+  );
+  const runStep = (stepName, action) => runAgentFlowStep(stepName, action, {
+    onProgress: reportProgress,
+    deadlineAt: jobDeadlineAt,
+    retryBaseDelayMs: dependencies.finalDisplayRetryBaseDelayMs,
+  });
+  const lookup = await runStep('project_lookup', () => dependencies.prepareProposalFromCompanyLookup({
     projectCode: code,
     publicBaseUrl,
-  });
+  }));
   if (!lookup?.found) {
     const error = new Error(lookup?.error_message || 'Project lookup failed.');
     error.statusCode = lookup?.error_code === 'COMPANY_PROJECT_NOT_FOUND' ? 404 : 502;
@@ -1403,8 +1815,6 @@ async function generateProjectFinalDisplayNow({
     throw error;
   }
 
-  const resumableRun = options.force ? null : latestOutputRunForCode(dependencies, code);
-  const runId = cleanString(options.runId) || cleanString(resumableRun?.runId) || createRunId(code);
   recordProjectDataLayerForRun({
     dependencies,
     normalizedCode: code,
@@ -1414,14 +1824,49 @@ async function generateProjectFinalDisplayNow({
     dataLayer,
   });
 
-  const generateImage = dependencies.generatePatternImage || generatePatternImage;
-  const composePrompt = dependencies.composeFinalPrompt || composeFinalPrompt;
-  const analyzeShapes = dependencies.analyzeMaterialShapeLevels || analyzeMaterialShapeLevels;
+  const runWithAiPermit = dependencies.runWithFinalDisplayAiPermit || runWithFinalDisplayAiPermit;
+  const rawGenerateImage = dependencies.generatePatternImage || generatePatternImage;
+  const rawComposePrompt = dependencies.composeFinalPrompt || composeFinalPrompt;
+  const rawAnalyzeShapes = dependencies.analyzeMaterialShapeLevels || analyzeMaterialShapeLevels;
+  const generateImage = (input) => runWithAiPermit(() => {
+    const providerOptions = deadlineBoundProviderOptions({
+      deadlineAt: jobDeadlineAt,
+      envKey: 'AI_IMAGE_GENERATOR_TIMEOUT_MS',
+      configuredTimeoutMs: getAiImageGeneratorConfig(process.env).timeoutMs,
+      maxCallTimeoutMs,
+      stage: 'generate',
+    });
+    return rawGenerateImage(input, providerOptions);
+  }, { deadlineAt: jobDeadlineAt });
+  const composePrompt = (input) => runWithAiPermit(() => {
+    const providerOptions = deadlineBoundProviderOptions({
+      deadlineAt: jobDeadlineAt,
+      envKey: 'AI_FINAL_PROMPT_COMPOSER_TIMEOUT_MS',
+      configuredTimeoutMs: getAiFinalPromptComposerConfig(process.env).timeoutMs,
+      maxCallTimeoutMs,
+      stage: 'prompt',
+    });
+    return rawComposePrompt(input, providerOptions);
+  }, { deadlineAt: jobDeadlineAt });
+  const analyzeShapes = (input) => runWithAiPermit(() => {
+    const providerOptions = deadlineBoundProviderOptions({
+      deadlineAt: jobDeadlineAt,
+      envKey: 'AI_MATERIAL_SHAPE_ANALYZER_TIMEOUT_MS',
+      configuredTimeoutMs: getAiMaterialShapeAnalyzerConfig(process.env).timeoutMs,
+      maxCallTimeoutMs,
+      stage: 'material_analysis',
+    });
+    return rawAnalyzeShapes(input, providerOptions);
+  }, { deadlineAt: jobDeadlineAt });
   const recordResult = dependencies.recordProjectGenerationResult || recordProjectGenerationResult;
+  const stageConcurrency = positiveInteger(
+    dependencies.finalDisplayStageConcurrency,
+    FINAL_DISPLAY_STAGE_CONCURRENCY,
+  );
 
   let currentRun = resumableRun;
   if (selectedMaterialImages.length > 0) {
-    currentRun = await runAgentFlowStep('material', () => generateMaterialOutputs({
+    currentRun = await runStep('material', () => generateMaterialOutputs({
       analyzeShapes,
       composePrompt,
       generateImage,
@@ -1437,11 +1882,12 @@ async function generateProjectFinalDisplayNow({
       unifiedSource: 'gallery_material_unified_cleanup',
       splitSource: 'gallery_material_split_cleanup',
       unifiedLabel: 'Unified gallery material',
+      stageConcurrency,
     })) || currentRun;
   }
 
   if (designReferenceImages.length > 0) {
-    currentRun = await runAgentFlowStep('reference', () => generateMaterialOutputs({
+    currentRun = await runStep('reference', () => generateMaterialOutputs({
       analyzeShapes,
       composePrompt,
       generateImage,
@@ -1457,6 +1903,7 @@ async function generateProjectFinalDisplayNow({
       unifiedSource: 'company_design_reference_unified_split',
       splitSource: 'company_design_reference_split',
       unifiedLabel: 'Unified design reference material',
+      stageConcurrency,
     })) || currentRun;
   }
 
@@ -1488,6 +1935,15 @@ async function generateProjectFinalDisplayNow({
   }));
   const missingHistoryTargets = finalTargets.filter((target) => !target.historyImage);
   if (missingHistoryTargets.length > 0) {
+    if (options.synchronous === true) {
+      await reportProgress({
+        stage: 'project_final_display',
+        status: 'blocked',
+        runStatus: 'blocked',
+        attempt: 1,
+        maxAttempts: 1,
+      });
+    }
     return buildBlockedProjectFinalDisplayResult({
       normalizedCode: code,
       publicBaseUrl,
@@ -1504,9 +1960,8 @@ async function generateProjectFinalDisplayNow({
     });
   }
 
-  const composedTargets = await runAgentFlowStep('prompt', async () => {
-    const items = [];
-    for (const target of finalTargets) {
+  const composedTargets = await runStep('prompt', async () => {
+    return mapWithConcurrency(finalTargets, stageConcurrency, async (target) => {
       const targetProject = {
         ...project,
         category: target.category || project.category,
@@ -1530,17 +1985,15 @@ async function generateProjectFinalDisplayNow({
         error.retryable = response.status !== 'missing_config';
         throw error;
       }
-      items.push({
+      return {
         target,
         inputImages: finalInputImages,
         composed: response,
-      });
-    }
-    return items;
+      };
+    });
   });
-  currentRun = await runAgentFlowStep('generate', async () => {
-    let runAfterGeneration = latestOutputRunForCode(dependencies, code) || currentRun;
-    for (const item of composedTargets) {
+  currentRun = await runStep('generate', async () => {
+    const generatedRuns = await mapWithConcurrency(composedTargets, stageConcurrency, async (item) => {
       const generationLabel = `Final generated design - ${item.target.category}`;
       const finalRequest = {
         prompt: item.composed.final_prompt,
@@ -1553,26 +2006,39 @@ async function generateProjectFinalDisplayNow({
         history_layout_lock_policy: item.composed.history_layout_lock_policy || 'layout_lock',
         history_layout_lock_reason: item.composed.history_layout_lock_reason || '',
         input_images: item.inputImages,
+        defer_project_run_completion: options.synchronous !== true,
       };
-      const latestOutputRun = latestOutputRunForCode(dependencies, code) || runAfterGeneration;
+      const latestOutputRun = latestOutputRunForCode(dependencies, code) || currentRun;
       if (!hasRecordedImageForRequest(
         latestOutputRun,
         'finalDesignImages',
         finalRequest.generation_source,
         finalRequest.generation_label,
       )) {
-        runAfterGeneration = await generateAndRecordImage({
+        return generateAndRecordImage({
           generateImage,
           recordResult,
           dependencies,
           normalizedCode: code,
           request: finalRequest,
-        }) || runAfterGeneration;
+        });
       }
-    }
-    return runAfterGeneration;
+      return latestOutputRun;
+    });
+    return latestOutputRunForCode(dependencies, code) ||
+      generatedRuns.filter(Boolean).at(-1) ||
+      currentRun;
   }) || currentRun;
 
+  if (options.synchronous === true) {
+    await reportProgress({
+      stage: 'project_final_display',
+      status: 'success',
+      runStatus: 'completed',
+      attempt: 1,
+      maxAttempts: 1,
+    });
+  }
   const run = generationOutputRun(latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun);
   const responseRun = runWithPublicUrls(run, publicBaseUrl);
   return {
@@ -1602,26 +2068,65 @@ async function prepareProjectFinalDisplay({
   }
 
   const publicBaseUrl = dependencies.publicBaseUrlFromRequest?.(request) || '';
-  const activeJob = options.force ? null : activeJobForProject(normalizedCode);
+  const callerRequestId = finalDisplayRequestId(request);
+  const requestedRunId = cleanString(options.runId);
+  const requestedRun = projectRunById(dependencies, normalizedCode, requestedRunId);
+  const requestedStatus = cleanString(requestedRun?.status).toLowerCase();
+  if (requestedStatus === 'failed' || requestedStatus === 'cancelled') {
+    throw terminalProjectRunError(requestedRun);
+  }
+  if (requestedStatus === 'blocked') {
+    const outputRun = generationOutputRun(requestedRun) || requestedRun;
+    return buildBlockedProjectFinalDisplayResult({
+      normalizedCode,
+      publicBaseUrl,
+      project: requestedRun.project || { projectCode: normalizedCode },
+      designReferenceImages: requestedRun.designReferenceImages || [],
+      run: outputRun,
+      runId: requestedRun.runId,
+      dataLayer: requestedRun.projectDataLayer || null,
+      reason: 'persisted_project_final_display_blocked',
+    });
+  }
+
+  const latestPersistedRun = latestProjectRunForCode(dependencies, normalizedCode);
+  if (
+    !requestedRunId &&
+    callerRequestId &&
+    cleanString(latestPersistedRun?.requestId) === callerRequestId &&
+    ['failed', 'cancelled'].includes(cleanString(latestPersistedRun?.status).toLowerCase())
+  ) {
+    throw terminalProjectRunError(latestPersistedRun);
+  }
+
+  let activeJob = options.force ? null : activeJobForProject(normalizedCode);
   if (activeJob) {
     if (activeJob.status === 'failed') {
-      throw activeJob.error;
+      const sameRun = requestedRunId && requestedRunId === cleanString(activeJob.runId);
+      const sameRequest = callerRequestId && callerRequestId === cleanString(activeJob.requestId);
+      if (sameRun || sameRequest || !callerRequestId) {
+        throw activeJob.error;
+      }
+      activeFinalDisplayJobs.delete(normalizedCode);
+      activeJob = null;
     }
 
-    if (activeJob.status === 'completed' && activeJob.result) {
+    if (activeJob?.status === 'completed' && activeJob.result) {
       return activeJob.result;
     }
 
-    const currentRun = latestOutputRunForCode(dependencies, normalizedCode) ||
-      latestProjectRunForCode(dependencies, normalizedCode);
-    return buildPendingProjectFinalDisplayResult({
-      normalizedCode,
-      publicBaseUrl,
-      run: currentRun,
-      runId: activeJob.runId,
-      dataLayer: null,
-      source: 'project_final_display_running',
-    });
+    if (activeJob) {
+      const currentRun = latestOutputRunForCode(dependencies, normalizedCode) ||
+        latestProjectRunForCode(dependencies, normalizedCode);
+      return buildPendingProjectFinalDisplayResult({
+        normalizedCode,
+        publicBaseUrl,
+        run: currentRun,
+        runId: activeJob.runId,
+        dataLayer: null,
+        source: 'project_final_display_running',
+      });
+    }
   }
 
   const cachedRun = options.force ? null : latestReusableOutputRunForCode(dependencies, normalizedCode);
@@ -1658,7 +2163,10 @@ async function prepareProjectFinalDisplay({
       normalizedCode,
       request,
       dependencies,
-      options,
+      options: {
+        ...options,
+        jobDeadlineAt: createFinalDisplayJobDeadline(dependencies),
+      },
     });
   }
 

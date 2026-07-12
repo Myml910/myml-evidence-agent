@@ -83,7 +83,15 @@ function readStore(options = {}) {
 function writeStore(store, options = {}) {
   const storePath = options.storePath || PROJECT_RUN_STORE_PATH;
   ensureDir(path.dirname(storePath));
-  fs.writeFileSync(storePath, JSON.stringify(store, null, 2));
+  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, JSON.stringify(store, null, 2));
+    fs.renameSync(temporaryPath, storePath);
+  } finally {
+    if (fs.existsSync(temporaryPath)) {
+      fs.unlinkSync(temporaryPath);
+    }
+  }
 }
 
 function createRunId(projectCode) {
@@ -197,6 +205,7 @@ function projectRunSummary(run) {
 
   return {
     runId: run.runId,
+    requestId: cleanString(run.requestId),
     projectCode: run.projectCode,
     status: run.status,
     createdAt: run.createdAt,
@@ -207,6 +216,24 @@ function projectRunSummary(run) {
     designReferenceImages: Array.isArray(run.designReferenceImages) ? run.designReferenceImages : [],
     projectDataLayer: run.projectDataLayer && typeof run.projectDataLayer === 'object'
       ? run.projectDataLayer
+      : null,
+    progress: run.progress && typeof run.progress === 'object'
+      ? {
+          stage: cleanString(run.progress.stage),
+          status: cleanString(run.progress.status),
+          attempt: Number(run.progress.attempt) || 0,
+          maxAttempts: Number(run.progress.maxAttempts) || 0,
+          durationMs: Number(run.progress.durationMs) || 0,
+          updatedAt: cleanString(run.progress.updatedAt),
+        }
+      : null,
+    error: run.error && typeof run.error === 'object'
+      ? {
+          code: cleanString(run.error.code),
+          retryable: Boolean(run.error.retryable),
+          stage: cleanString(run.error.stage),
+          failedAt: cleanString(run.error.failedAt),
+        }
       : null,
   };
 }
@@ -306,7 +333,13 @@ function recordProjectGenerationResult(request = {}, result = {}, options = {}) 
   }
 
   appendUniqueImages(run, collection, records);
-  run.status = collection === 'finalDesignImages' ? 'completed' : 'running';
+  const defersRunCompletion = collection === 'finalDesignImages' && (
+    request.defer_project_run_completion === true ||
+    request.deferProjectRunCompletion === true
+  );
+  run.status = collection === 'finalDesignImages' && !defersRunCompletion
+    ? 'completed'
+    : 'running';
   run.updatedAt = nowIso();
   run.events = [
     ...(Array.isArray(run.events) ? run.events : []),
@@ -360,6 +393,75 @@ function recordProjectRunMetadata(request = {}, metadata = {}, options = {}) {
   return projectRunSummary(run);
 }
 
+function recordProjectRunProgress(request = {}, progress = {}, options = {}) {
+  const projectCode = normalizeProjectCode(request.project_code || request.projectCode);
+  if (!projectCode) {
+    return null;
+  }
+
+  const stage = cleanString(progress.stage) || 'project_final_display';
+  const progressStatus = cleanString(progress.status) || 'running';
+  const runStatus = cleanString(progress.runStatus);
+  const now = nowIso();
+  const store = readStore(options);
+  const run = ensureRun(store, projectCode, request.project_run_id || request.projectRunId);
+  const requestId = cleanString(request.request_id || request.requestId);
+  if (requestId) {
+    run.requestId = requestId;
+  }
+  const errorCode = cleanString(progress.error?.code || progress.errorCode);
+  const retryable = Boolean(progress.error?.retryable ?? progress.retryable);
+
+  if (runStatus) {
+    run.status = runStatus;
+  }
+
+  run.updatedAt = now;
+  run.progress = {
+    stage,
+    status: progressStatus,
+    attempt: Number(progress.attempt) || 0,
+    maxAttempts: Number(progress.maxAttempts) || 0,
+    durationMs: Number(progress.durationMs) || 0,
+    updatedAt: now,
+  };
+
+  if (progressStatus === 'failed' || runStatus === 'failed') {
+    run.error = {
+      code: errorCode || 'EVIDENCE_AGENT_FINAL_DISPLAY_FAILED',
+      retryable,
+      stage,
+      failedAt: now,
+    };
+  } else if (
+    progressStatus === 'started' ||
+    progressStatus === 'success' ||
+    progressStatus === 'blocked' ||
+    runStatus === 'completed'
+  ) {
+    run.error = null;
+  }
+
+  run.events = [
+    ...(Array.isArray(run.events) ? run.events : []),
+    {
+      stage,
+      collection: 'progress',
+      status: progressStatus,
+      attempt: Number(progress.attempt) || 0,
+      maxAttempts: Number(progress.maxAttempts) || 0,
+      durationMs: Number(progress.durationMs) || 0,
+      errorCode: errorCode || undefined,
+      retryable: errorCode ? retryable : undefined,
+      imageCount: 0,
+      createdAt: now,
+    },
+  ].slice(-MAX_STORED_EVENTS);
+
+  writeStore(store, options);
+  return projectRunSummary(run);
+}
+
 function getProjectRun(runId, options = {}) {
   const safeRunId = safeIdPart(runId, '');
   if (!safeRunId) {
@@ -401,5 +503,6 @@ module.exports = {
   getProjectRunsForCode,
   projectRunSummary,
   recordProjectRunMetadata,
+  recordProjectRunProgress,
   recordProjectGenerationResult,
 };

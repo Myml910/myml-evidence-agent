@@ -63,6 +63,7 @@ const {
   getProjectRun,
   getProjectRunsForCode,
   recordProjectGenerationResult,
+  recordProjectRunProgress,
 } = require('./services/projectRunStore');
 const { prepareProjectFinalDisplay } = require('./services/projectFinalDisplayService');
 const { createCanvasChatRouter } = require('./services/canvasChatContract');
@@ -102,6 +103,7 @@ app.use('/v1', createCanvasChatRouter({
     getLatestProjectRunForCode,
     getProjectRun,
     getProjectRunsForCode,
+    recordProjectRunProgress,
   },
   publicBaseUrlFromRequest,
   version: packageJson.version,

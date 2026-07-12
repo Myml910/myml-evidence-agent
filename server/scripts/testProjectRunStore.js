@@ -8,6 +8,7 @@ const {
   getProjectRunsForCode,
   recordProjectGenerationResult,
   recordProjectRunMetadata,
+  recordProjectRunProgress,
 } = require('../services/projectRunStore');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myml-project-run-store-'));
@@ -83,6 +84,21 @@ assert.strictEqual(metadataRun.projectDataLayer.sections.designReferenceImages.c
 assert.deepStrictEqual(metadataRun.projectDataLayer.sections.graphicElements.aiExtracted, ['wild flowers']);
 assert.deepStrictEqual(metadataRun.projectDataLayer.sections.textElements.visible, ['CLEVELAND']);
 
+const progressRun = recordProjectRunProgress({
+  project_code: 'YXF2606190001',
+  project_run_id: 'run_test_1',
+}, {
+  stage: 'material',
+  status: 'started',
+  runStatus: 'running',
+  attempt: 1,
+  maxAttempts: 3,
+}, options);
+assert.strictEqual(progressRun.status, 'running');
+assert.strictEqual(progressRun.progress.stage, 'material');
+assert.strictEqual(progressRun.progress.attempt, 1);
+assert.strictEqual(progressRun.error, null);
+
 const base64Image = Buffer.from('fake png bytes').toString('base64');
 const finalRun = recordProjectGenerationResult({
   project_code: 'YXF2606190001',
@@ -110,6 +126,46 @@ assert.strictEqual(finalRun.finalDesignImages.length, 1);
 assert.strictEqual(finalRun.projectDataLayer.sections.designReferenceImages.count, 1);
 assert(finalRun.finalDesignImages[0].imageUrl.startsWith('/test-project-run-assets/run_test_1/final_design-1-'));
 assert(!JSON.stringify(finalRun).includes(base64Image));
+
+const automatedRun = recordProjectGenerationResult({
+  project_code: 'YXF2606190002',
+  project_run_id: 'run_test_automated',
+  generation_stage: 'final_design',
+  generation_source: 'automated_flow_final_generation',
+  generation_label: 'Automated final design',
+  defer_project_run_completion: true,
+}, {
+  status: 'success',
+  source: 'ai_image_generator',
+  model: 'gpt-image-2',
+  request_mode: 'edits',
+  input_image_count: 2,
+  images: [{ b64_json: base64Image, mime_type: 'image/png' }],
+}, options);
+assert.strictEqual(automatedRun.status, 'running');
+
+const failedRun = recordProjectRunProgress({
+  project_code: 'YXF2606190002',
+  project_run_id: 'run_test_automated',
+  request_id: 'request_test_automated',
+}, {
+  stage: 'reference',
+  status: 'failed',
+  runStatus: 'failed',
+  attempt: 3,
+  maxAttempts: 3,
+  error: {
+    code: 'EVIDENCE_AGENT_REFERENCE_FAILED',
+    message: 'must not be persisted',
+    retryable: false,
+  },
+}, options);
+assert.strictEqual(failedRun.status, 'failed');
+assert.strictEqual(failedRun.requestId, 'request_test_automated');
+assert.strictEqual(failedRun.progress.stage, 'reference');
+assert.strictEqual(failedRun.error.code, 'EVIDENCE_AGENT_REFERENCE_FAILED');
+assert.strictEqual(failedRun.error.retryable, false);
+assert(!JSON.stringify(failedRun).includes('must not be persisted'));
 
 const fetchedByRunId = getProjectRun('run_test_1', options);
 assert.strictEqual(fetchedByRunId.finalDesignImages.length, 1);

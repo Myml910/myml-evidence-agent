@@ -713,6 +713,152 @@ async function main() {
   assert.match(comboGenerateCalls[3].inputImages[0].url, /plate-history\.png$/);
   assert.match(comboGenerateCalls[4].inputImages[0].url, /napkin-history\.png$/);
 
+  const partialGenerateCalls = [];
+  const partialCategoryDependencies = {
+    ...asyncDependencies,
+    prepareProposalFromCompanyLookup: async () => ({
+      found: true,
+      project_code: 'YXF2511160011',
+      proposal: {
+        project_code: 'YXF2511160011',
+        project_name: 'wind chime and greeting card set',
+        ai_graphic_elements: 'botanical gift theme',
+        text_elements: 'BEST WISHES',
+        design_requirement: 'combo set with wind chime and envelope greeting card',
+        reference_images: [{
+          source_field: 'design_img',
+          url: 'https://assets.example.test/partial-design-reference.png',
+          filename: 'partial-design-reference.png',
+          label: 'Company design reference',
+        }],
+      },
+      selected_gallery_images: { selected_images: [] },
+      category_judgment: {
+        predicted_category: 'wind chime',
+        predicted_categories: [
+          {
+            category: 'wind chime',
+            confidence: 0.96,
+            reason: 'primary product',
+          },
+          {
+            category: 'envelope greeting card',
+            confidence: 0.86,
+            reason: 'secondary product',
+            category_image: {
+              category: 'envelope greeting card',
+              image_url: 'https://assets.example.test/card-history.png',
+              image_filename: 'card-history.png',
+              note: 'card layout',
+            },
+          },
+        ],
+      },
+    }),
+    generatePatternImage: async (request) => {
+      partialGenerateCalls.push({
+        stage: request.generation_stage,
+        category: request.category,
+      });
+      return {
+        status: 'success',
+        source: 'ai_image_generator',
+        model: 'gpt-image-2',
+        request_mode: request.request_mode || 'edits',
+        input_image_count: request.input_images.length,
+        images: [{
+          b64_json: Buffer.from(`${request.generation_stage}:${request.category}:${partialGenerateCalls.length}`).toString('base64'),
+          mime_type: 'image/png',
+        }],
+      };
+    },
+  };
+  const partialCategoryResult = await prepareProjectFinalDisplay({
+    projectCode: 'YXF2511160011',
+    request: {},
+    dependencies: partialCategoryDependencies,
+    options: { synchronous: true },
+  });
+
+  assert.strictEqual(partialCategoryResult.status, 'partial');
+  assert.strictEqual(partialCategoryResult.run.elementImages.length, 3);
+  assert.strictEqual(partialCategoryResult.run.finalDesignImages.length, 1);
+  assert.deepStrictEqual(
+    partialGenerateCalls
+      .filter((call) => call.stage === 'final_design')
+      .map((call) => call.category),
+    ['envelope greeting card'],
+  );
+  assert(partialCategoryResult.warnings.includes('partial_history_layout_coverage'));
+  assert(partialCategoryResult.warnings.some((warning) => warning.includes('wind chime')));
+  assert.deepStrictEqual(
+    partialCategoryResult.display.projectDataLayer.sections.categoryTargets.items
+      .map((target) => [target.category, target.hasHistoryTemplate]),
+    [
+      ['wind chime', false],
+      ['envelope greeting card', true],
+    ],
+  );
+  const persistedPartialCategory = getLatestProjectRunForCode('YXF2511160011', storeOptions);
+  assert.strictEqual(persistedPartialCategory.status, 'completed');
+  assert.strictEqual(persistedPartialCategory.progress.status, 'partial');
+  const partialGenerateCallCount = partialGenerateCalls.length;
+  const cachedPartialCategoryResult = await prepareProjectFinalDisplay({
+    projectCode: 'YXF2511160011',
+    request: {},
+    dependencies: partialCategoryDependencies,
+    options: { synchronous: true },
+  });
+  assert.strictEqual(cachedPartialCategoryResult.status, 'partial');
+  assert.strictEqual(cachedPartialCategoryResult.source, 'cached_project_final_display');
+  assert.strictEqual(partialGenerateCalls.length, partialGenerateCallCount);
+
+  const noHistoryResult = await prepareProjectFinalDisplay({
+    projectCode: 'YXF2511160012',
+    request: {},
+    dependencies: {
+      ...partialCategoryDependencies,
+      prepareProposalFromCompanyLookup: async () => ({
+        found: true,
+        project_code: 'YXF2511160012',
+        proposal: {
+          project_code: 'YXF2511160012',
+          project_name: 'wind chime only',
+          ai_graphic_elements: 'botanical gift theme',
+          text_elements: '',
+          design_requirement: 'wind chime design',
+          reference_images: [{
+            source_field: 'design_img',
+            url: 'https://assets.example.test/no-history-reference.png',
+            filename: 'no-history-reference.png',
+            label: 'Company design reference',
+          }],
+        },
+        selected_gallery_images: { selected_images: [] },
+        category_judgment: {
+          predicted_category: 'wind chime',
+          predicted_categories: [{
+            category: 'wind chime',
+            confidence: 0.96,
+            reason: 'primary product',
+          }],
+        },
+      }),
+    },
+    options: { synchronous: true },
+  });
+
+  assert.strictEqual(noHistoryResult.status, 'partial');
+  assert.strictEqual(noHistoryResult.run.status, 'partial');
+  assert.strictEqual(noHistoryResult.run.elementImages.length, 3);
+  assert.strictEqual(noHistoryResult.run.finalDesignImages.length, 0);
+  assert.strictEqual(noHistoryResult.display.materialImageBlock.length, 3);
+  assert.strictEqual(noHistoryResult.display.finalImageGeneration.length, 0);
+  assert(noHistoryResult.warnings.some((warning) => warning.includes('wind chime')));
+  const persistedNoHistoryResult = getLatestProjectRunForCode('YXF2511160012', storeOptions);
+  assert.strictEqual(persistedNoHistoryResult.status, 'completed');
+  assert.strictEqual(persistedNoHistoryResult.progress.status, 'partial');
+
   console.log('[test:project-final-display] Project final display tests passed.');
 }
 

@@ -18,6 +18,10 @@ const {
   recordProjectRunProgress,
   recordProjectGenerationResult,
 } = require('./projectRunStore');
+const {
+  persistProjectReferenceImages,
+  referenceSourceHash,
+} = require('./projectReferenceMediaStore');
 
 const FINAL_DISPLAY_PROMPT_TEMPLATE_ID = 'structured_ai';
 const FINAL_DISPLAY_FINAL_GENERATION_SOURCE = 'automated_flow_final_generation';
@@ -1068,6 +1072,106 @@ function isReusableFinalDisplayRun(run) {
     hasDisplayRun(generationOutputRun(run));
 }
 
+function dataLayerWithPersistedDesignReferences(dataLayer, images = []) {
+  if (!dataLayer || typeof dataLayer !== 'object') return dataLayer;
+  const sections = dataLayer.sections && typeof dataLayer.sections === 'object'
+    ? dataLayer.sections
+    : {};
+  const designSection = sections.designReferenceImages && typeof sections.designReferenceImages === 'object'
+    ? sections.designReferenceImages
+    : {};
+  return {
+    ...dataLayer,
+    sections: {
+      ...sections,
+      designReferenceImages: {
+        ...designSection,
+        count: images.length,
+        items: images,
+      },
+    },
+  };
+}
+
+function selectedPersistedDesignReferences(sourceImages = [], persistedImages = []) {
+  const bySourceHash = new Map(
+    persistedImages
+      .filter((image) => cleanString(image?.sourceUrlHash))
+      .map((image) => [cleanString(image.sourceUrlHash), image]),
+  );
+  return sourceImages
+    .map((image) => {
+      const persisted = bySourceHash.get(referenceSourceHash(image?.imageUrl || image?.thumbnailUrl));
+      if (!persisted) return null;
+      return {
+        ...image,
+        imageUrl: persisted.imageUrl,
+        thumbnailUrl: persisted.thumbnailUrl || persisted.imageUrl,
+        sourceUrlHash: persisted.sourceUrlHash,
+        mimeType: persisted.mimeType,
+        bytes: persisted.bytes,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function persistDesignReferenceMediaForRun({
+  dependencies,
+  runId,
+  designReferenceImages = [],
+  dataLayer,
+}) {
+  const dataLayerImages = Array.isArray(dataLayer?.sections?.designReferenceImages?.items)
+    ? dataLayer.sections.designReferenceImages.items
+    : [];
+  const sourceImages = dataLayerImages.length > 0 ? dataLayerImages : designReferenceImages;
+  if (!runId || sourceImages.length === 0) {
+    return {
+      dataLayer: dataLayerWithPersistedDesignReferences(dataLayer, []),
+      designReferenceImages: [],
+      failureCount: 0,
+      changed: dataLayerImages.length > 0 || designReferenceImages.length > 0,
+    };
+  }
+
+  const persistReferences = dependencies.persistProjectReferenceImages || persistProjectReferenceImages;
+  let result;
+  try {
+    result = await persistReferences({
+      runId,
+      images: sourceImages,
+    });
+  } catch (_error) {
+    result = {
+      images: [],
+      failures: sourceImages.map((_image, index) => ({ index })),
+    };
+  }
+
+  const persistedImages = Array.isArray(result?.images) ? result.images : [];
+  const safeDesignReferenceImages = selectedPersistedDesignReferences(
+    designReferenceImages,
+    persistedImages,
+  );
+  const sourceUrls = sourceImages.map((image) => cleanString(image?.imageUrl || image?.thumbnailUrl));
+  const persistedUrls = persistedImages.map((image) => cleanString(image?.imageUrl || image?.thumbnailUrl));
+
+  return {
+    dataLayer: dataLayerWithPersistedDesignReferences(dataLayer, persistedImages),
+    designReferenceImages: safeDesignReferenceImages,
+    failureCount: Array.isArray(result?.failures) ? result.failures.length : 0,
+    changed: sourceUrls.length !== persistedUrls.length ||
+      sourceUrls.some((value, index) => value !== persistedUrls[index]) ||
+      designReferenceImages.length !== safeDesignReferenceImages.length,
+  };
+}
+
+function referenceMediaWarnings(failureCount) {
+  return failureCount > 0
+    ? [`company_design_reference_media_unavailable:${failureCount}`]
+    : [];
+}
+
 function isPartialFinalDisplayRun(run) {
   const runId = cleanString(run?.runId);
   return isProjectFinalDisplayRunId(runId) && hasAnyDisplayImage(generationOutputRun(run));
@@ -1751,27 +1855,42 @@ async function generateProjectFinalDisplayNow({
           request,
           dependencies,
         });
-    const dataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
-    if (!cachedRun.projectDataLayer && lookupData?.dataLayer) {
+    const sourceDataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
+    const sourceDesignReferenceImages = cachedRun.designReferenceImages ||
+      (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []);
+    const referenceMedia = await persistDesignReferenceMediaForRun({
+      dependencies,
+      runId: cachedRun.runId,
+      designReferenceImages: sourceDesignReferenceImages,
+      dataLayer: sourceDataLayer,
+    });
+    const dataLayer = referenceMedia.dataLayer;
+    const safeDesignReferenceImages = referenceMedia.designReferenceImages;
+    if (referenceMedia.changed || (!cachedRun.projectDataLayer && lookupData?.dataLayer)) {
       recordProjectDataLayerForRun({
         dependencies,
         normalizedCode: code,
         runId: cachedRun.runId,
-        project: lookupData.project,
-        designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+        project: cachedRun.project || lookupData?.project,
+        designReferenceImages: safeDesignReferenceImages,
         dataLayer,
       });
     }
-    const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
+    const responseRun = runWithPublicUrls({
+      ...cachedRun,
+      designReferenceImages: safeDesignReferenceImages,
+      projectDataLayer: dataLayer,
+    }, publicBaseUrl);
     return {
       status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: code },
-      designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),
+      designReferenceImages: safeDesignReferenceImages,
       run: responseRun,
       dataLayer,
       display: buildFinalDisplayView(responseRun, dataLayer),
       usage: { providerCost: false },
+      warnings: referenceMediaWarnings(referenceMedia.failureCount),
     };
   }
 
@@ -1808,15 +1927,25 @@ async function generateProjectFinalDisplayNow({
   }
 
   const project = projectPreviewFromLookup(lookup);
-  const dataLayer = buildProjectDataLayerFromLookup(lookup);
+  const sourceDataLayer = buildProjectDataLayerFromLookup(lookup);
   const selectedMaterialImages = selectedMaterialImagesFromLookup(lookup);
-  const designReferenceImages = designReferenceImagesFromLookup(lookup);
-  if (selectedMaterialImages.length === 0 && designReferenceImages.length === 0) {
+  const generationDesignReferenceImages = designReferenceImagesFromLookup(lookup);
+  if (selectedMaterialImages.length === 0 && generationDesignReferenceImages.length === 0) {
     const error = new Error('No material or company design reference image is available for final display generation.');
     error.statusCode = 422;
     error.code = 'EVIDENCE_AGENT_NO_DESIGN_REFERENCE_IMAGE';
     throw error;
   }
+
+  const referenceMedia = await persistDesignReferenceMediaForRun({
+    dependencies,
+    runId,
+    designReferenceImages: generationDesignReferenceImages,
+    dataLayer: sourceDataLayer,
+  });
+  const dataLayer = referenceMedia.dataLayer;
+  const designReferenceImages = referenceMedia.designReferenceImages;
+  const mediaWarnings = referenceMediaWarnings(referenceMedia.failureCount);
 
   recordProjectDataLayerForRun({
     dependencies,
@@ -1889,7 +2018,7 @@ async function generateProjectFinalDisplayNow({
     })) || currentRun;
   }
 
-  if (designReferenceImages.length > 0) {
+  if (generationDesignReferenceImages.length > 0) {
     currentRun = await runStep('reference', () => generateMaterialOutputs({
       analyzeShapes,
       composePrompt,
@@ -1900,9 +2029,9 @@ async function generateProjectFinalDisplayNow({
       runId,
       publicBaseUrl,
       project,
-      sourceImages: designReferenceImages,
+      sourceImages: generationDesignReferenceImages,
       sourceKind: 'design_reference',
-      sourceLabel: designReferenceSourceLabel(designReferenceImages),
+      sourceLabel: designReferenceSourceLabel(generationDesignReferenceImages),
       unifiedSource: 'company_design_reference_unified_split',
       splitSource: 'company_design_reference_split',
       unifiedLabel: 'Unified design reference material',
@@ -1961,6 +2090,7 @@ async function generateProjectFinalDisplayNow({
       warnings: [
         'Default automatic final-display flow requires a category history layout image before final image generation.',
         `Missing category history layouts: ${missingHistoryTargets.map((target) => target.category).join(', ')}`,
+        ...mediaWarnings,
       ],
     });
   }
@@ -2062,7 +2192,7 @@ async function generateProjectFinalDisplayNow({
     dataLayer,
     display: buildFinalDisplayView(responseRun, dataLayer),
     usage: { providerCost: true },
-    warnings: partialHistoryWarnings,
+    warnings: [...partialHistoryWarnings, ...mediaWarnings],
   };
 }
 
@@ -2090,15 +2220,32 @@ async function prepareProjectFinalDisplay({
   }
   if (requestedStatus === 'blocked') {
     const outputRun = generationOutputRun(requestedRun) || requestedRun;
+    const referenceMedia = await persistDesignReferenceMediaForRun({
+      dependencies,
+      runId: requestedRun.runId,
+      designReferenceImages: requestedRun.designReferenceImages || [],
+      dataLayer: requestedRun.projectDataLayer || null,
+    });
+    if (referenceMedia.changed) {
+      recordProjectDataLayerForRun({
+        dependencies,
+        normalizedCode,
+        runId: requestedRun.runId,
+        project: requestedRun.project,
+        designReferenceImages: referenceMedia.designReferenceImages,
+        dataLayer: referenceMedia.dataLayer,
+      });
+    }
     return buildTerminalProjectFinalDisplayResult({
       normalizedCode,
       publicBaseUrl,
       project: requestedRun.project || { projectCode: normalizedCode },
-      designReferenceImages: requestedRun.designReferenceImages || [],
+      designReferenceImages: referenceMedia.designReferenceImages,
       run: outputRun,
       runId: requestedRun.runId,
-      dataLayer: requestedRun.projectDataLayer || null,
+      dataLayer: referenceMedia.dataLayer,
       reason: 'persisted_project_final_display_blocked',
+      warnings: referenceMediaWarnings(referenceMedia.failureCount),
     });
   }
 
@@ -2147,27 +2294,42 @@ async function prepareProjectFinalDisplay({
     const lookupData = cachedRun.projectDataLayer || options.synchronous === true
       ? null
       : await lookupProjectDataLayerWithTimeout({ normalizedCode, request, dependencies });
-    const dataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
-    if (!cachedRun.projectDataLayer && lookupData?.dataLayer) {
+    const sourceDataLayer = cachedRun.projectDataLayer || lookupData?.dataLayer || null;
+    const sourceDesignReferenceImages = cachedRun.designReferenceImages ||
+      (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []);
+    const referenceMedia = await persistDesignReferenceMediaForRun({
+      dependencies,
+      runId: cachedRun.runId,
+      designReferenceImages: sourceDesignReferenceImages,
+      dataLayer: sourceDataLayer,
+    });
+    const dataLayer = referenceMedia.dataLayer;
+    const safeDesignReferenceImages = referenceMedia.designReferenceImages;
+    if (referenceMedia.changed || (!cachedRun.projectDataLayer && lookupData?.dataLayer)) {
       recordProjectDataLayerForRun({
         dependencies,
         normalizedCode,
         runId: cachedRun.runId,
-        project: lookupData.project,
-        designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+        project: cachedRun.project || lookupData?.project,
+        designReferenceImages: safeDesignReferenceImages,
         dataLayer,
       });
     }
-    const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
+    const responseRun = runWithPublicUrls({
+      ...cachedRun,
+      designReferenceImages: safeDesignReferenceImages,
+      projectDataLayer: dataLayer,
+    }, publicBaseUrl);
     return {
       status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: normalizedCode },
-      designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),
+      designReferenceImages: safeDesignReferenceImages,
       run: responseRun,
       dataLayer,
       display: buildFinalDisplayView(responseRun, dataLayer),
       usage: { providerCost: false },
+      warnings: referenceMediaWarnings(referenceMedia.failureCount),
     };
   }
 
@@ -2188,14 +2350,23 @@ async function prepareProjectFinalDisplay({
   const lookupData = partialRun?.projectDataLayer
     ? null
     : await lookupProjectDataLayerWithTimeout({ normalizedCode, request, dependencies }, 5000);
-  const dataLayer = partialRun?.projectDataLayer || lookupData?.dataLayer || null;
-  if (!partialRun?.projectDataLayer && lookupData?.dataLayer) {
+  const sourceDataLayer = partialRun?.projectDataLayer || lookupData?.dataLayer || null;
+  const sourceDesignReferenceImages = partialRun?.designReferenceImages ||
+    (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []);
+  const referenceMedia = await persistDesignReferenceMediaForRun({
+    dependencies,
+    runId,
+    designReferenceImages: sourceDesignReferenceImages,
+    dataLayer: sourceDataLayer,
+  });
+  const dataLayer = referenceMedia.dataLayer;
+  if (referenceMedia.changed || (!partialRun?.projectDataLayer && lookupData?.dataLayer)) {
     recordProjectDataLayerForRun({
       dependencies,
       normalizedCode,
       runId,
-      project: lookupData.project,
-      designReferenceImages: lookupData.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : [],
+      project: partialRun?.project || lookupData?.project,
+      designReferenceImages: referenceMedia.designReferenceImages,
       dataLayer,
     });
   }
@@ -2215,6 +2386,10 @@ async function prepareProjectFinalDisplay({
     runId,
     dataLayer,
     source: partialRun ? 'project_final_display_resuming' : 'project_final_display_started',
+    warnings: [
+      'project_final_display_running',
+      ...referenceMediaWarnings(referenceMedia.failureCount),
+    ],
   });
 }
 

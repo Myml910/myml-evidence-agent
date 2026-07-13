@@ -9,6 +9,7 @@ const {
   recordProjectRunMetadata,
   recordProjectRunProgress,
 } = require('../services/projectRunStore');
+const { referenceSourceHash } = require('../services/projectReferenceMediaStore');
 const { prepareProjectFinalDisplay } = require('../services/projectFinalDisplayService');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myml-final-display-'));
@@ -19,6 +20,25 @@ const storeOptions = {
 };
 
 const calls = [];
+
+async function persistReferenceMediaForTest({ runId, images }) {
+  return {
+    images: (Array.isArray(images) ? images : []).map((image) => {
+      const sourceUrl = image.imageUrl || image.thumbnailUrl || '';
+      const sourceUrlHash = referenceSourceHash(sourceUrl);
+      const imageUrl = `/test-assets/${encodeURIComponent(runId)}/references/reference-${sourceUrlHash}.png`;
+      return {
+        ...image,
+        imageUrl,
+        thumbnailUrl: imageUrl,
+        sourceUrlHash,
+        mimeType: 'image/png',
+        bytes: 68,
+      };
+    }),
+    failures: [],
+  };
+}
 
 function recordGeneratedImage(request, label) {
   return recordProjectGenerationResult(request, {
@@ -90,6 +110,63 @@ async function main() {
   assert.match(result.run.finalDesignImages[0].imageUrl, /^http:\/\/127\.0\.0\.1:3101\/test-assets\/prun-YXF2511160004-product\//);
   assert.deepStrictEqual(calls, []);
 
+  const legacyRunId = 'prun-YXF2511160013-legacy-direct-reference';
+  recordGeneratedImage({
+    project_code: 'YXF2511160013',
+    project_run_id: legacyRunId,
+    generation_stage: 'element_image',
+    generation_source: 'company_design_reference_split',
+    generation_label: 'legacy material',
+  }, 'legacy material');
+  recordGeneratedImage({
+    project_code: 'YXF2511160013',
+    project_run_id: legacyRunId,
+    generation_stage: 'final_design',
+    generation_source: 'automated_flow_final_generation',
+    generation_label: 'legacy final',
+  }, 'legacy final');
+  const legacyReferenceUrl = 'https://assets.example.test/legacy-reference.png?token=legacy';
+  recordProjectRunMetadata({
+    project_code: 'YXF2511160013',
+    project_run_id: legacyRunId,
+  }, {
+    project: { projectCode: 'YXF2511160013' },
+    designReferenceImages: [{
+      id: 'legacy-reference',
+      imageUrl: legacyReferenceUrl,
+      thumbnailUrl: legacyReferenceUrl,
+    }],
+    projectDataLayer: {
+      projectCode: 'YXF2511160013',
+      sections: {
+        designReferenceImages: {
+          count: 1,
+          items: [{
+            id: 'legacy-reference',
+            imageUrl: legacyReferenceUrl,
+            thumbnailUrl: legacyReferenceUrl,
+          }],
+        },
+      },
+    },
+  }, storeOptions);
+  const legacyCached = await prepareProjectFinalDisplay({
+    projectCode: 'YXF2511160013',
+    request: {},
+    dependencies: {
+      publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+      persistProjectReferenceImages: persistReferenceMediaForTest,
+      getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
+      recordProjectRunMetadata: (request, metadata) => recordProjectRunMetadata(request, metadata, storeOptions),
+    },
+  });
+  assert.strictEqual(legacyCached.source, 'cached_project_final_display');
+  assert.strictEqual(legacyCached.designReferenceImages.length, 1);
+  assert(!JSON.stringify(legacyCached).includes('assets.example.test'));
+  const migratedLegacyRun = getLatestProjectRunForCode('YXF2511160013', storeOptions);
+  assert(!JSON.stringify(migratedLegacyRun.designReferenceImages).includes('assets.example.test'));
+  assert(!JSON.stringify(migratedLegacyRun.projectDataLayer).includes('assets.example.test'));
+
   const generatedCalls = [];
   const composeCalls = [];
   const providerTimeouts = [];
@@ -98,6 +175,7 @@ async function main() {
     request: {},
     dependencies: {
       publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+      persistProjectReferenceImages: persistReferenceMediaForTest,
       getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
@@ -201,6 +279,8 @@ async function main() {
   assert.strictEqual(generatedStoredRun.progress.status, 'success');
   assert.strictEqual(generatedStoredRun.projectDataLayer.sections.designReferenceImages.count, 1);
   assert.deepStrictEqual(generatedStoredRun.projectDataLayer.sections.textElements.visible, ['CLEVELAND']);
+  assert(!JSON.stringify(generatedStoredRun.projectDataLayer.sections.designReferenceImages).includes('assets.example.test'));
+  assert(!JSON.stringify(generatedStoredRun.designReferenceImages).includes('assets.example.test'));
   assert(providerTimeouts.every((timeoutMs) => timeoutMs > 0 && timeoutMs <= 5000));
   assert.strictEqual(generatedCalls.length, 7);
   assert.deepStrictEqual(generatedCalls.map((call) => call.source), [
@@ -235,6 +315,7 @@ async function main() {
     request: {},
     dependencies: {
       publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+      persistProjectReferenceImages: persistReferenceMediaForTest,
       getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),
@@ -322,6 +403,19 @@ async function main() {
   });
 
   assert.strictEqual(unified.status, 'completed');
+  assert.strictEqual(unified.display.projectDataLayer.sections.designReferenceImages.count, 5);
+  assert.strictEqual(unified.designReferenceImages.length, 3);
+  assert(unified.display.projectDataLayer.sections.designReferenceImages.items.every(
+    (image) => image.imageUrl.startsWith('/test-assets/prun-YXF2511160007-'),
+  ));
+  assert(unified.designReferenceImages.every(
+    (image) => image.imageUrl.startsWith('/test-assets/prun-YXF2511160007-'),
+  ));
+  assert(!JSON.stringify(unified.display.projectDataLayer).includes('assets.example.test'));
+  assert(!JSON.stringify(unified.designReferenceImages).includes('assets.example.test'));
+  const unifiedStoredRun = getLatestProjectRunForCode('YXF2511160007', storeOptions);
+  assert(!JSON.stringify(unifiedStoredRun.projectDataLayer.sections.designReferenceImages).includes('assets.example.test'));
+  assert(!JSON.stringify(unifiedStoredRun.designReferenceImages).includes('assets.example.test'));
   assert.deepStrictEqual(
     unifiedAnalyzeCalls[0].input_images.map((image) => image.filename),
     [
@@ -352,6 +446,7 @@ async function main() {
   let maxActiveAsyncGenerations = 0;
   const asyncDependencies = {
     publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+    persistProjectReferenceImages: persistReferenceMediaForTest,
     finalDisplayRetryBaseDelayMs: 1,
     getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
     getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
@@ -571,6 +666,7 @@ async function main() {
     request: {},
     dependencies: {
       publicBaseUrlFromRequest: () => 'http://127.0.0.1:3101',
+      persistProjectReferenceImages: persistReferenceMediaForTest,
       getProjectRunsForCode: (projectCode) => getProjectRunsForCode(projectCode, storeOptions),
       getLatestProjectRunForCode: (projectCode) => getLatestProjectRunForCode(projectCode, storeOptions),
       recordProjectGenerationResult: (request, result) => recordProjectGenerationResult(request, result, storeOptions),

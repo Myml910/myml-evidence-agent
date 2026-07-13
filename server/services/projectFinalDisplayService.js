@@ -1563,7 +1563,7 @@ function buildPendingProjectFinalDisplayResult({
   };
 }
 
-function buildBlockedProjectFinalDisplayResult({
+function buildTerminalProjectFinalDisplayResult({
   normalizedCode,
   publicBaseUrl,
   project,
@@ -1571,14 +1571,16 @@ function buildBlockedProjectFinalDisplayResult({
   run,
   runId,
   dataLayer = null,
+  status = 'blocked',
   reason,
   warnings = [],
 } = {}) {
+  const terminalStatus = status === 'partial' ? 'partial' : 'blocked';
   const outputRun = generationOutputRun(run) || {};
   const responseRun = runWithPublicUrls({
     runId: cleanString(outputRun.runId) || cleanString(runId),
     projectCode: cleanString(outputRun.projectCode) || normalizedCode,
-    status: 'blocked',
+    status: terminalStatus,
     createdAt: outputRun.createdAt,
     updatedAt: outputRun.updatedAt,
     elementImages: Array.isArray(outputRun.elementImages) ? outputRun.elementImages : [],
@@ -1587,8 +1589,8 @@ function buildBlockedProjectFinalDisplayResult({
     error: outputRun.error || null,
   }, publicBaseUrl);
   return {
-    status: 'blocked',
-    source: 'project_final_display_blocked',
+    status: terminalStatus,
+    source: `project_final_display_${terminalStatus}`,
     project: project || { projectCode: normalizedCode },
     designReferenceImages,
     run: responseRun,
@@ -1685,9 +1687,10 @@ function startProjectFinalDisplayJob({
     .then(async (result) => {
       job.finishedAt = Date.now();
       const blocked = result?.status === 'blocked';
+      const partial = result?.status === 'partial';
       await reportProgress({
         stage: 'project_final_display',
-        status: blocked ? 'blocked' : 'success',
+        status: blocked ? 'blocked' : partial ? 'partial' : 'success',
         runStatus: blocked ? 'blocked' : 'completed',
         attempt: 1,
         maxAttempts: 1,
@@ -1761,7 +1764,7 @@ async function generateProjectFinalDisplayNow({
     }
     const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
     return {
-      status: 'completed',
+      status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: code },
       designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),
@@ -1934,17 +1937,18 @@ async function generateProjectFinalDisplayNow({
     historyImage: historyImageFromCategoryTarget(lookup, target),
   }));
   const missingHistoryTargets = finalTargets.filter((target) => !target.historyImage);
-  if (missingHistoryTargets.length > 0) {
+  const readyFinalTargets = finalTargets.filter((target) => target.historyImage);
+  if (readyFinalTargets.length === 0) {
     if (options.synchronous === true) {
       await reportProgress({
         stage: 'project_final_display',
-        status: 'blocked',
-        runStatus: 'blocked',
+        status: 'partial',
+        runStatus: 'completed',
         attempt: 1,
         maxAttempts: 1,
       });
     }
-    return buildBlockedProjectFinalDisplayResult({
+    return buildTerminalProjectFinalDisplayResult({
       normalizedCode: code,
       publicBaseUrl,
       project,
@@ -1952,6 +1956,7 @@ async function generateProjectFinalDisplayNow({
       run: currentRun,
       runId,
       dataLayer,
+      status: 'partial',
       reason: 'missing_history_layout_image',
       warnings: [
         'Default automatic final-display flow requires a category history layout image before final image generation.',
@@ -1959,9 +1964,15 @@ async function generateProjectFinalDisplayNow({
       ],
     });
   }
+  const partialHistoryWarnings = missingHistoryTargets.length > 0
+    ? [
+        'partial_history_layout_coverage',
+        `Skipped categories without history layouts: ${missingHistoryTargets.map((target) => target.category).join(', ')}`,
+      ]
+    : [];
 
   const composedTargets = await runStep('prompt', async () => {
-    return mapWithConcurrency(finalTargets, stageConcurrency, async (target) => {
+    return mapWithConcurrency(readyFinalTargets, stageConcurrency, async (target) => {
       const targetProject = {
         ...project,
         category: target.category || project.category,
@@ -2030,10 +2041,11 @@ async function generateProjectFinalDisplayNow({
       currentRun;
   }) || currentRun;
 
+  const completionStatus = missingHistoryTargets.length > 0 ? 'partial' : 'completed';
   if (options.synchronous === true) {
     await reportProgress({
       stage: 'project_final_display',
-      status: 'success',
+      status: completionStatus === 'partial' ? 'partial' : 'success',
       runStatus: 'completed',
       attempt: 1,
       maxAttempts: 1,
@@ -2042,7 +2054,7 @@ async function generateProjectFinalDisplayNow({
   const run = generationOutputRun(latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun);
   const responseRun = runWithPublicUrls(run, publicBaseUrl);
   return {
-    status: 'completed',
+    status: completionStatus,
     source: 'generated_project_final_display',
     project,
     designReferenceImages,
@@ -2050,6 +2062,7 @@ async function generateProjectFinalDisplayNow({
     dataLayer,
     display: buildFinalDisplayView(responseRun, dataLayer),
     usage: { providerCost: true },
+    warnings: partialHistoryWarnings,
   };
 }
 
@@ -2077,7 +2090,7 @@ async function prepareProjectFinalDisplay({
   }
   if (requestedStatus === 'blocked') {
     const outputRun = generationOutputRun(requestedRun) || requestedRun;
-    return buildBlockedProjectFinalDisplayResult({
+    return buildTerminalProjectFinalDisplayResult({
       normalizedCode,
       publicBaseUrl,
       project: requestedRun.project || { projectCode: normalizedCode },
@@ -2147,7 +2160,7 @@ async function prepareProjectFinalDisplay({
     }
     const responseRun = runWithPublicUrls(cachedRun, publicBaseUrl);
     return {
-      status: 'completed',
+      status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: normalizedCode },
       designReferenceImages: cachedRun.designReferenceImages || (lookupData?.lookup ? designReferenceImagesFromLookup(lookupData.lookup) : []),

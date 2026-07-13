@@ -436,6 +436,7 @@ function recordProjectRunProgress(request = {}, progress = {}, options = {}) {
   } else if (
     progressStatus === 'started' ||
     progressStatus === 'success' ||
+    progressStatus === 'partial' ||
     progressStatus === 'blocked' ||
     runStatus === 'completed'
   ) {

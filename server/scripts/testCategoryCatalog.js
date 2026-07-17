@@ -53,7 +53,7 @@ function main() {
         image_url: 'https://assets.example.test/new-party-kit.png',
         note: 'Manual category.',
       },
-      { filePath, overridesPath },
+      { filePath, overridesPath, commitFile },
     );
     assert.strictEqual(added.entry.category, 'New Party Kit');
     assert.strictEqual(added.catalog.candidate_count, 3);
@@ -66,7 +66,7 @@ function main() {
         image_url: 'https://assets.example.test/new-party-kit-v2.png',
         note: 'Updated image.',
       },
-      { filePath, overridesPath },
+      { filePath, overridesPath, commitFile },
     );
     assert.strictEqual(updated.catalog.candidate_count, 3);
     assert.strictEqual(updated.catalog.manual_count, 2);
@@ -84,7 +84,7 @@ function main() {
         category: 'Pending Image Category',
         note: 'Image can be added later.',
       },
-      { filePath, overridesPath },
+      { filePath, overridesPath, commitFile },
     );
     const pendingImageEntry = findCategoryCatalogEntry('Pending Image Category', {
       catalog: pendingImageCategory.catalog,
@@ -193,7 +193,7 @@ function main() {
     const removedLastEntry = findCategoryCatalogEntry('Door Magnet', { catalog: removedLast.catalog });
     assert.strictEqual(removedLastEntry.image_url, '');
     assert.strictEqual(removedLastEntry.history_images.length, 0);
-    assert.strictEqual(committedFiles.length, 6);
+    assert.strictEqual(committedFiles.length, 9);
     assert.strictEqual(deletedFiles.length, 2);
     assert(committedFiles.some((entry) => entry.targetPath.endsWith('.png')));
     assert(committedFiles.some((entry) => entry.targetPath === overridesPath));

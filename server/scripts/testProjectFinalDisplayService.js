@@ -17,6 +17,7 @@ const storeOptions = {
   storePath: path.join(tempDir, 'project-runs.json'),
   assetDir: path.join(tempDir, 'assets'),
   assetPublicPath: '/test-assets',
+  commitFile: () => {},
 };
 
 const calls = [];

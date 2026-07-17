@@ -22,6 +22,10 @@ function main() {
   const filePath = path.join(tempDir, 'category-candidates.json');
   const overridesPath = path.join(tempDir, 'category-catalog-overrides.json');
   const uploadDir = path.join(tempDir, 'category-images');
+  const committedFiles = [];
+  const deletedFiles = [];
+  const commitFile = (targetPath, details) => committedFiles.push({ targetPath, details });
+  const recordDelete = (targetPath) => deletedFiles.push(targetPath);
 
   try {
     writeJson(filePath, ['Plates', '-', 'Door Magnet']);
@@ -104,6 +108,7 @@ function main() {
         overridesPath,
         uploadDir,
         publicBaseUrl: 'http://127.0.0.1:3102',
+        commitFile,
       },
     );
     const uploadedEntry = findCategoryCatalogEntry('Door Magnet', { catalog: uploaded.catalog });
@@ -135,6 +140,7 @@ function main() {
         overridesPath,
         uploadDir,
         publicBaseUrl: 'http://127.0.0.1:3102',
+        commitFile,
       },
     );
     const multiImageEntry = findCategoryCatalogEntry('Door Magnet', { catalog: uploadedAgain.catalog });
@@ -168,6 +174,8 @@ function main() {
         overridesPath,
         uploadDir,
         publicBaseUrl: 'http://127.0.0.1:3101',
+        commitFile,
+        recordDelete,
       },
     );
     const removedFirstEntry = findCategoryCatalogEntry('Door Magnet', { catalog: removedFirst.catalog });
@@ -180,11 +188,15 @@ function main() {
         category: 'Door Magnet',
         image_url: secondUploadedImageUrl,
       },
-      { filePath, overridesPath, uploadDir },
+      { filePath, overridesPath, uploadDir, commitFile, recordDelete },
     );
     const removedLastEntry = findCategoryCatalogEntry('Door Magnet', { catalog: removedLast.catalog });
     assert.strictEqual(removedLastEntry.image_url, '');
     assert.strictEqual(removedLastEntry.history_images.length, 0);
+    assert.strictEqual(committedFiles.length, 6);
+    assert.strictEqual(deletedFiles.length, 2);
+    assert(committedFiles.some((entry) => entry.targetPath.endsWith('.png')));
+    assert(committedFiles.some((entry) => entry.targetPath === overridesPath));
 
     assert.throws(
       () => addCategoryCatalogEntry(

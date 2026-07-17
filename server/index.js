@@ -67,6 +67,7 @@ const {
 } = require('./services/projectRunStore');
 const { prepareProjectFinalDisplay } = require('./services/projectFinalDisplayService');
 const { createCanvasChatRouter } = require('./services/canvasChatContract');
+const { initializeEvidenceStorage } = require('./storage/evidenceStorageRuntime');
 
 const app = express();
 const host = process.env.HOST || '127.0.0.1';
@@ -339,6 +340,7 @@ app.use((error, _request, response, _next) => {
 });
 
 if (require.main === module) {
+  initializeEvidenceStorage();
   const server = app.listen(port, host, () => {
     console.log(`MYML Evidence Agent server listening at http://${host}:${port}`);
   });

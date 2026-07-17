@@ -1,6 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const { EVIDENCE_DATA_DIR } = require('../config/dataPaths');
+const {
+  commitEvidenceFileSync,
+  recordEvidenceDeleteSync,
+} = require('../storage/evidenceStorageRuntime');
+const { writeFileAtomicSync } = require('../storage/localFileCommit');
 
 const CATEGORY_CANDIDATES_PATH = path.join(EVIDENCE_DATA_DIR, 'category-candidates.json');
 const CATEGORY_CATALOG_OVERRIDES_PATH = path.join(
@@ -223,11 +228,15 @@ function createNotFoundError(message) {
   return error;
 }
 
-function writeJsonArrayAtomic(filePath, rows) {
+function writeJsonArrayAtomic(filePath, rows, options = {}) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(tempPath, `${JSON.stringify(rows, null, 2)}\n`, 'utf8');
-  fs.renameSync(tempPath, filePath);
+  const payload = `${JSON.stringify(rows, null, 2)}\n`;
+  writeFileAtomicSync(filePath, payload, { encoding: 'utf8' });
+  const commitFile = options.commitFile || commitEvidenceFileSync;
+  commitFile(filePath, {
+    body: Buffer.from(payload),
+    contentType: 'application/json',
+  });
 }
 
 function uniqueHistoryImages(images = []) {
@@ -338,7 +347,7 @@ function addCategoryCatalogEntry(input = {}, options = {}) {
     nextEntries.push(nextEntry);
   }
 
-  writeJsonArrayAtomic(overridesPath, nextEntries);
+  writeJsonArrayAtomic(overridesPath, nextEntries, options);
   cachedCatalog = null;
 
   return {
@@ -426,7 +435,12 @@ function saveCategoryCatalogImageUpload(input = {}, options = {}) {
   const now = new Date().toISOString();
 
   fs.mkdirSync(uploadDir, { recursive: true });
-  fs.writeFileSync(filePath, decoded.buffer);
+  writeFileAtomicSync(filePath, decoded.buffer);
+  const commitFile = options.commitFile || commitEvidenceFileSync;
+  commitFile(filePath, {
+    body: decoded.buffer,
+    contentType: decoded.mimeType,
+  });
 
   return addCategoryCatalogEntry(
     {
@@ -447,6 +461,7 @@ function saveCategoryCatalogImageUpload(input = {}, options = {}) {
       filePath: options.filePath,
       overridesPath: options.overridesPath,
       publicBaseUrl: options.publicBaseUrl,
+      commitFile,
     },
   );
 }
@@ -503,7 +518,12 @@ function collectReferencedUploadFileNames(entries = []) {
   return referenced;
 }
 
-function removeUploadedImageFileIfUnreferenced(imageUrl, entries, uploadDir = CATEGORY_IMAGE_UPLOAD_DIR) {
+function removeUploadedImageFileIfUnreferenced(
+  imageUrl,
+  entries,
+  uploadDir = CATEGORY_IMAGE_UPLOAD_DIR,
+  recordDelete = recordEvidenceDeleteSync,
+) {
   const filename = publicUploadFileNameFromUrl(imageUrl);
   if (!filename || collectReferencedUploadFileNames(entries).has(filename)) {
     return;
@@ -516,6 +536,7 @@ function removeUploadedImageFileIfUnreferenced(imageUrl, entries, uploadDir = CA
   }
   if (fs.existsSync(targetPath)) {
     fs.unlinkSync(targetPath);
+    recordDelete(targetPath);
   }
 }
 
@@ -570,8 +591,13 @@ function removeCategoryCatalogImage(input = {}, options = {}) {
   const nextEntries = [...normalizedEntries];
   nextEntries[existingIndex] = nextEntry;
 
-  writeJsonArrayAtomic(overridesPath, nextEntries);
-  removeUploadedImageFileIfUnreferenced(imageUrl, nextEntries, options.uploadDir);
+  writeJsonArrayAtomic(overridesPath, nextEntries, options);
+  removeUploadedImageFileIfUnreferenced(
+    imageUrl,
+    nextEntries,
+    options.uploadDir,
+    options.recordDelete || recordEvidenceDeleteSync,
+  );
   cachedCatalog = null;
 
   return {

@@ -5,6 +5,8 @@ const {
   PROJECT_RUN_ASSET_DIR,
   PROJECT_RUN_ASSET_PUBLIC_PATH,
 } = require('./projectRunStore');
+const { commitEvidenceFileSync } = require('../storage/evidenceStorageRuntime');
+const { writeFileAtomicSync } = require('../storage/localFileCommit');
 
 const DEFAULT_TIMEOUT_MS = 30 * 1000;
 const DEFAULT_MAX_BYTES = 25 * 1024 * 1024;
@@ -310,13 +312,11 @@ async function persistOneReference(image, context) {
     });
     const fileName = `reference-${sourceHash}.${downloaded.extension}`;
     const finalPath = path.join(context.outputDir, fileName);
-    const temporaryPath = `${finalPath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-    try {
-      fs.writeFileSync(temporaryPath, downloaded.buffer, { mode: 0o600 });
-      fs.renameSync(temporaryPath, finalPath);
-    } finally {
-      if (fs.existsSync(temporaryPath)) fs.unlinkSync(temporaryPath);
-    }
+    writeFileAtomicSync(finalPath, downloaded.buffer);
+    context.commitFile(finalPath, {
+      body: downloaded.buffer,
+      contentType: downloaded.contentType,
+    });
     return publicImageRecord(
       image,
       `${context.publicDir}/${encodeURIComponent(fileName)}`,
@@ -354,6 +354,7 @@ async function persistProjectReferenceImages({ runId, images } = {}, options = {
   fs.mkdirSync(outputDir, { recursive: true, mode: 0o700 });
 
   const context = {
+    commitFile: options.commitFile || commitEvidenceFileSync,
     fetchImpl: options.fetchImpl || globalThis.fetch,
     maxBytes: positiveInteger(options.maxBytes, DEFAULT_MAX_BYTES),
     outputDir,

@@ -12,10 +12,12 @@ const {
 } = require('../services/projectRunStore');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myml-project-run-store-'));
+const committedFiles = [];
 const options = {
   storePath: path.join(tempDir, 'project-runs.json'),
   assetDir: path.join(tempDir, 'assets'),
   assetPublicPath: '/test-project-run-assets',
+  commitFile: (filePath, details) => committedFiles.push({ filePath, details }),
 };
 
 const elementRun = recordProjectGenerationResult({
@@ -179,5 +181,15 @@ assert.deepStrictEqual(fetchedLatest.projectDataLayer.sections.textElements.visi
 const fetchedRuns = getProjectRunsForCode('YXF2606190001', options);
 assert.strictEqual(fetchedRuns.length, 1);
 assert.strictEqual(fetchedRuns[0].runId, 'run_test_1');
+
+assert.strictEqual(
+  committedFiles.filter((entry) => entry.filePath === options.storePath).length,
+  6,
+);
+assert.strictEqual(
+  committedFiles.filter((entry) => entry.filePath.endsWith('.png')).length,
+  2,
+);
+assert(committedFiles.every((entry) => entry.details.body));
 
 console.log('[test:project-run-store] Project run store tests passed.');

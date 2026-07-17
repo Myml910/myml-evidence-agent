@@ -17,6 +17,8 @@ const png = Buffer.from(
   'base64',
 );
 let fetchCount = 0;
+const committedFiles = [];
+const commitFile = (filePath, details) => committedFiles.push({ filePath, details });
 
 async function fetchImage(url) {
   fetchCount += 1;
@@ -66,6 +68,7 @@ async function main() {
     env,
     fetchImpl: fetchImage,
     concurrency: 3,
+    commitFile,
   });
 
   assert.strictEqual(first.images.length, 5);
@@ -94,6 +97,7 @@ async function main() {
     assetPublicPath: '/project-run-assets',
     env,
     fetchImpl: fetchImage,
+    commitFile,
   });
   assert.deepStrictEqual(second.images.map((image) => image.imageUrl), first.images.map((image) => image.imageUrl));
   assert.strictEqual(fetchCount, 5);
@@ -111,6 +115,7 @@ async function main() {
     env,
     fetchImpl: fetchImage,
     concurrency: 2,
+    commitFile,
   });
   assert.strictEqual(duplicates.images.length, 2);
   assert.strictEqual(duplicates.images[0].imageUrl, duplicates.images[1].imageUrl);
@@ -130,6 +135,7 @@ async function main() {
     env,
     fetchImpl: fetchImage,
     maxBytes: 1024,
+    commitFile,
   });
   assert.strictEqual(failures.images.length, 0);
   assert.deepStrictEqual(failures.failures.map((failure) => failure.code), [
@@ -151,9 +157,13 @@ async function main() {
     fetchImpl: async () => {
       throw new Error('Persisted assets must not be fetched again.');
     },
+    commitFile,
   });
   assert.strictEqual(alreadyPersisted.images.length, 1);
   assert.strictEqual(alreadyPersisted.failures.length, 0);
+  assert.strictEqual(committedFiles.length, 6);
+  assert(committedFiles.every((entry) => entry.filePath.endsWith('.png')));
+  assert(committedFiles.every((entry) => entry.details.contentType === 'image/png'));
 
   console.log('[test:project-reference-media] Project reference media tests passed.');
 }

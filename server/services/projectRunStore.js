@@ -2,6 +2,8 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { EVIDENCE_RUNTIME_DIR } = require('../config/dataPaths');
+const { commitEvidenceFileSync } = require('../storage/evidenceStorageRuntime');
+const { writeFileAtomicSync } = require('../storage/localFileCommit');
 
 const PROJECT_RUN_DATA_DIR = EVIDENCE_RUNTIME_DIR;
 const PROJECT_RUN_STORE_PATH = path.join(PROJECT_RUN_DATA_DIR, 'project-runs.json');
@@ -82,16 +84,13 @@ function readStore(options = {}) {
 
 function writeStore(store, options = {}) {
   const storePath = options.storePath || PROJECT_RUN_STORE_PATH;
-  ensureDir(path.dirname(storePath));
-  const temporaryPath = `${storePath}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
-  try {
-    fs.writeFileSync(temporaryPath, JSON.stringify(store, null, 2));
-    fs.renameSync(temporaryPath, storePath);
-  } finally {
-    if (fs.existsSync(temporaryPath)) {
-      fs.unlinkSync(temporaryPath);
-    }
-  }
+  const commitFile = options.commitFile || commitEvidenceFileSync;
+  const payload = JSON.stringify(store, null, 2);
+  writeFileAtomicSync(storePath, payload, { encoding: 'utf8' });
+  commitFile(storePath, {
+    body: Buffer.from(payload),
+    contentType: 'application/json',
+  });
 }
 
 function createRunId(projectCode) {
@@ -176,7 +175,13 @@ function saveBase64Image(image, context, options = {}) {
   const ext = mimeExtension(image.mime_type || decoded.mimeType);
   const digest = hashValue(decoded.buffer);
   const fileName = `${safeIdPart(context.stage, 'stage')}-${context.index + 1}-${digest}.${ext}`;
-  fs.writeFileSync(path.join(outputDir, fileName), decoded.buffer);
+  const filePath = path.join(outputDir, fileName);
+  writeFileAtomicSync(filePath, decoded.buffer);
+  const commitFile = options.commitFile || commitEvidenceFileSync;
+  commitFile(filePath, {
+    body: decoded.buffer,
+    contentType: decoded.mimeType,
+  });
 
   return `${publicPath}/${encodeURIComponent(runDirName)}/${encodeURIComponent(fileName)}`;
 }

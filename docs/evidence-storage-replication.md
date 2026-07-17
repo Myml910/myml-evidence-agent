@@ -45,14 +45,15 @@ removed.
 
 ## Activation gate
 
-This release must first be deployed with:
+The foundation release was first deployed with:
 
 ```text
 activeDriver=filesystem
 replication.mode=disabled
 ```
 
-Do not change `replication.mode` until all of these are true:
+This activation release changes only `replication.mode` to
+`filesystem-to-s3`. Deploy it only after all of these are true:
 
 - Canvas and Evidence services are stopped and have no active work.
 - The fixed runtime and static roots match the deployed service environment.
@@ -62,6 +63,5 @@ Do not change `replication.mode` until all of these are true:
   `0700`.
 - A rollback procedure has been prepared and no local source data is deleted.
 
-Activation is a separate deployment that changes only the tracked replication
-mode to `filesystem-to-s3`, validates the queue worker, and then restarts the
-Evidence service under observation.
+After deploying this activation release, validate the queue worker and restart
+the Evidence service under observation.

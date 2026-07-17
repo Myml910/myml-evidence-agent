@@ -57,7 +57,7 @@ const storageConfig = deepFreeze(assertStorageConfigSafe({
     publicRead: false,
   },
   replication: {
-    mode: 'disabled',
+    mode: 'filesystem-to-s3',
     journalDir: process.platform === 'win32'
       ? WINDOWS_JOURNAL_DIR
       : LINUX_JOURNAL_DIR,

@@ -138,7 +138,7 @@ async function main() {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'myml-evidence-storage-'));
   try {
     assert.equal(storageConfig.activeDriver, 'filesystem');
-    assert.equal(storageConfig.replication.mode, 'disabled');
+    assert.equal(storageConfig.replication.mode, 'filesystem-to-s3');
     assert.equal(storageConfig.replication.mirrorDeletes, false);
     assert.equal(storageConfig.migration.mode, 'historical-backfill-verified');
     assert.equal(storageConfig.s3.endpoint, 'http://172.50.0.68:15017');

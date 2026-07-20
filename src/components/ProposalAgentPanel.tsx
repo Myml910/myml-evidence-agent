@@ -609,8 +609,11 @@ type ImageToImageInputImage = {
   matchedElements?: string[];
   selectedByDesignRequirement?: boolean;
   designReferenceIndex?: number;
+  designRequirementDirective?: string;
+  designRequirementRoles?: string[];
   sourceField?: string;
   materialShapeLevel?: MaterialShapeLevel['key'];
+  category?: string;
 };
 
 type CategoryGenerationTarget = {
@@ -758,28 +761,109 @@ function parseChineseReferenceNumber(value: string) {
   return 0;
 }
 
-function collectDesignRequirementReferenceIndices(proposal: CompanyProjectProposal) {
-  const designRequirement = String(proposal.design_requirement || '');
+function referenceIndicesFromRequirementText(value: string) {
   const indices = new Set<number>();
+  const numberGroupPattern = /[0-9]+|[一二两三四五六七八九十]+/g;
   const patterns = [
-    /(?:公司)?(?:设计)?参考\s*(?:图|图片)\s*[:：#-]?\s*([0-9一二两三四五六七八九十]+)/g,
-    /(?:风格|图案风格|配色|颜色|底色|图案)\s*(?:见|看|参考|按|按照|跟)\s*(?:公司)?(?:设计)?参考\s*(?:图|图片)\s*([0-9一二两三四五六七八九十]+)/g,
-    /(?:形状|外形|轮廓|图案|主体|主图|树|文案|文字|排版|布局|版式|配色|颜色|底色|风格)?\s*(?:见|看|参考|按|按照|跟)\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*([0-9一二两三四五六七八九十]+)/g,
-    /第\s*([0-9一二两三四五六七八九十]+)\s*(?:张)?\s*(?:公司)?(?:设计)?参考\s*(?:图|图片)/g,
+    /(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
+    /第\s*([0-9一二两三四五六七八九十]+)\s*(?:张)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)/g,
   ];
 
   patterns.forEach((pattern) => {
-    let match = pattern.exec(designRequirement);
+    let match = pattern.exec(value);
     while (match) {
-      const parsed = parseChineseReferenceNumber(match[1] || '');
-      if (parsed > 0) {
-        indices.add(parsed);
-      }
-      match = pattern.exec(designRequirement);
+      const numberMatches = (match[1] || '').match(numberGroupPattern) || [];
+      numberMatches.forEach((numberText) => {
+        const parsed = parseChineseReferenceNumber(numberText);
+        if (parsed > 0) {
+          indices.add(parsed);
+        }
+      });
+      match = pattern.exec(value);
     }
   });
 
   return Array.from(indices).sort((left, right) => left - right);
+}
+
+function designRequirementRoles(value: string) {
+  const roles: string[] = [];
+  if (/(形状|外形|轮廓|刀模|款式)/i.test(value)) roles.push('形状/轮廓依据');
+  if (/(图案|主体|主图|元素|装饰|角色)/i.test(value)) roles.push('图案素材依据');
+  if (/(排版|布局|版式|位置|一面|另一面)/i.test(value)) roles.push('排版/位置依据');
+  if (/(文案|文字|字体|字形|标题)/i.test(value)) roles.push('文字依据');
+  if (/(配色|颜色|色系|底色|背景|黑色|白色|紫色|蓝色|粉色|红色|绿色|黄色|橙色)/i.test(value)) roles.push('配色/背景依据');
+  if (/(风格|可爱|卡通|童趣|复古|简约|高端|酷|温馨)/i.test(value)) roles.push('风格依据');
+  return uniqueDisplayTerms(roles.length > 0 ? roles : ['开发思路指定参考依据']);
+}
+
+function collectDesignRequirementImageDirectives(proposal: CompanyProjectProposal) {
+  const designRequirement = String(proposal.design_requirement || '');
+  const directiveMap = new Map<number, { directives: string[]; roles: string[] }>();
+  const fragments = designRequirement
+    .replace(/\r?\n/g, '，')
+    .split(/[，,；;。.!！?？]+/)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+
+  fragments.forEach((fragment, index) => {
+    const referenceIndices = referenceIndicesFromRequirementText(fragment);
+    if (referenceIndices.length === 0) return;
+    const previousFragment = fragments[index - 1] || '';
+    const referenceOnly = /^(?:见|看|参考|按|按照|跟|根据)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*[0-9一二两三四五六七八九十、,，和及\s]+$/i.test(fragment);
+    const directive = shortLabel(
+      referenceOnly && previousFragment && referenceIndicesFromRequirementText(previousFragment).length === 0
+        ? `${previousFragment}，${fragment}`
+        : fragment,
+      240,
+    );
+    const roles = designRequirementRoles(directive);
+    referenceIndices.forEach((referenceIndex) => {
+      const current = directiveMap.get(referenceIndex) || { directives: [], roles: [] };
+      directiveMap.set(referenceIndex, {
+        directives: uniqueDisplayTerms([...current.directives, directive]),
+        roles: uniqueDisplayTerms([...current.roles, ...roles]),
+      });
+    });
+  });
+
+  return directiveMap;
+}
+
+function collectDesignRequirementReferenceIndices(proposal: CompanyProjectProposal) {
+  const directiveIndices = Array.from(collectDesignRequirementImageDirectives(proposal).keys());
+  const allIndices = referenceIndicesFromRequirementText(String(proposal.design_requirement || ''));
+  return Array.from(new Set([...directiveIndices, ...allIndices])).sort((left, right) => left - right);
+}
+
+function designRequirementImageBindingSummary(images: ImageToImageInputImage[]) {
+  return images
+    .filter((image) => image.designRequirementDirective)
+    .map((image) => [
+      `${image.label}（图${image.designReferenceIndex || '-'}）`,
+      `开发思路原文：${image.designRequirementDirective}`,
+      image.designRequirementRoles?.length
+        ? `必须承担：${image.designRequirementRoles.join('、')}`
+        : '',
+    ].filter(Boolean).join('；'))
+    .join('\n');
+}
+
+function appendDesignRequirementImageBinding(
+  baseDetail: string,
+  image: ImageToImageInputImage,
+) {
+  if (!image.designRequirementDirective) {
+    return baseDetail;
+  }
+  return [
+    baseDetail,
+    `开发思路对图${image.designReferenceIndex || '-'}的具体要求：${image.designRequirementDirective}。`,
+    image.designRequirementRoles?.length
+      ? `该图在素材生成中必须承担：${image.designRequirementRoles.join('、')}。`
+      : '',
+    '不得把该图与其他参考图的职责混用。',
+  ].filter(Boolean).join(' ');
 }
 
 function removeCarrierSizePhrases(value: string) {
@@ -2725,7 +2809,7 @@ function materialExtractionInputImages(
     label: image.label,
     filename: image.filename,
     url: image.url,
-    detail: image.detail,
+    detail: appendDesignRequirementImageBinding(image.detail, image),
   }));
 }
 
@@ -2880,10 +2964,12 @@ function buildMaterialRefinementPrompt(
   textElements: string[],
   shapeLevel: MaterialShapeLevel,
   shapeAnalysis: MaterialShapeAnalysisResponse | null,
+  designRequirementDirectives: string[] = [],
 ) {
   const graphicElementSummary =
     graphicElements.length > 0 ? graphicElements.join('、') : '输入图中与开发需求匹配的主要图案元素';
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
+  const designRequirementSummary = designRequirementDirectives.join('；');
 
   return [
     `请基于输入图只提取【${shapeLevel.title}】，生成一张可直接用于后续图案设计的${shapeLevel.label}干净素材图。`,
@@ -2893,6 +2979,9 @@ function buildMaterialRefinementPrompt(
     textElementSummary
       ? `文字元素判定依据：${textElementSummary}`
       : '文字元素为空：不要提取、重绘或新增未要求的可读主题文字。',
+    designRequirementSummary
+      ? `公司开发思路/设计要求：${designRequirementSummary}。必须用来决定当前品类应该保留哪些现有素材；其中指定图几的要求只作用于对应公司设计参考图，不得把其他图职责强加给内部图库素材。`
+      : '',
     `来源素材：${sourceImageSummary(images)}。`,
     buildMaterialShapeAnalysisInstruction(shapeAnalysis, shapeLevel),
     `元素/文字分层判定：${buildShapeLevelElementJudgment(shapeLevel, graphicElementSummary, textElementSummary)}`,
@@ -2925,6 +3014,7 @@ function buildUnifiedMaterialBoardPrompt(
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
   const designRequirementSummary =
     designRequirementDirectives.length > 0 ? designRequirementDirectives.join('；') : '';
+  const imageBindingSummary = designRequirementImageBindingSummary(images);
 
   return [
     `请基于输入的${sourceLabel}，整理成一张可用于后续图案设计的统一素材板。`,
@@ -2942,6 +3032,9 @@ function buildUnifiedMaterialBoardPrompt(
     designRequirementSummary
       ? `开发思路设计指令：${designRequirementSummary}。这些信息只用于判断哪些现有元素值得保留，不用于生成输入图中不存在的新图案。`
       : '',
+    imageBindingSummary
+      ? `开发思路图片职责绑定（必须逐图执行，不得混用）：\n${imageBindingSummary}`
+      : '',
     `来源图片：${sourceImageSummary(images)}。`,
     '保留规则：保留输入图中已经存在的独立贴图、成品小图案、主题字形、角色、图标、边框和局部装饰；元素外观、配色、线条和水彩/纹理质感尽量不变。',
     '清理规则：必须去除尺寸标注、红色尺寸线、红色框选、cm/mm 数字、商品截图界面、下载/查看按钮、价格/平台/店铺信息、背景场景、阴影摄影质感和无关空白。',
@@ -2954,9 +3047,10 @@ function buildMaterialBoardReversePrompt(
   sourceLabel: string,
   sourceNames: string,
   shapeAnalysis: MaterialShapeAnalysisResponse | null,
+  materialKind = '素材图',
 ) {
   return [
-    '请对输入的统一素材板做提示词反推，只分析图中已经存在的视觉内容。',
+    `请对输入的${materialKind}做提示词反推，只分析图中已经存在的视觉内容。`,
     `素材来源：${sourceLabel}；来源图片：${sourceNames}。`,
     shapeAnalysis ? `上一步 AI 判断：${materialShapeAnalysisSummary(shapeAnalysis)}。` : '',
     '这一步只输出图像视觉描述，不要输出生成建议、流程解释或额外标题。',
@@ -2969,16 +3063,17 @@ function buildMaterialBoardRegenerationPrompt(
   reverseDescription: string,
   sourceLabel: string,
   sourceNames: string,
+  materialKind = '素材图',
 ) {
   return [
-    '请只基于下方反推视觉描述，文生图生成一张可用于后续图案设计的新统一素材板。',
+    `请只基于下方反推视觉描述，文生图生成一张可用于后续图案设计的新${materialKind}。`,
     '',
     `素材来源：${sourceLabel}；来源图片：${sourceNames}。`,
-    '工作模式：这是统一素材板的反推重生成，不是最终成品设计，不是按照文字另行创作新主题。',
+    `工作模式：这是${materialKind}的反推重生成，不是最终成品设计，不是按照文字另行创作新主题。`,
     '保真规则：必须保留反推描述中记录的素材本体，包括元素造型、文字字形、线条、纹理、局部装饰、边框语言和配色关系；只允许修复压缩瑕疵、边缘瑕疵、噪点、粘连和排版不清。',
     '禁止新增：不要新增反推描述以外的新主体、新文字、新图标、新角色或新装饰；不要把素材重新组合成最终产品图、完整餐具/纸巾/包装展示或历史版式构图。',
     '清理规则：继续去除载体、尺寸标注、商品截图界面、平台/价格/店铺信息、背景场景、摄影阴影和无关说明。',
-    '输出形式：纯色背景上的干净统一素材板，每个独立素材之间留出清楚间距，边缘完整，主体清晰，方便后续和一级形、二级形、三级形分层素材一起进入最终输入。',
+    `输出形式：纯色背景上的干净${materialKind}，每个独立素材之间留出清楚间距，边缘完整，主体清晰，方便后续进入最终输入。`,
     '',
     '反推视觉描述：',
     reverseDescription,
@@ -2988,6 +3083,7 @@ function buildMaterialBoardRegenerationPrompt(
 function collectGenerationDesignReferenceImages(result: ProposalAgentPrepareResponse): ImageToImageInputImage[] {
   const requestedReferenceIndices = collectDesignRequirementReferenceIndices(result.proposal);
   const requestedReferenceIndexSet = new Set(requestedReferenceIndices);
+  const imageDirectiveMap = collectDesignRequirementImageDirectives(result.proposal);
   const designImages = (result.proposal.reference_images || []).filter(isCompanyDesignReferenceImage);
   const externalEvidenceImages = (result.proposal.reference_images || []).filter(isExternalEvidenceReferenceImage);
   const sourceImages = designImages.length > 0 ? designImages : externalEvidenceImages;
@@ -3009,21 +3105,33 @@ function collectGenerationDesignReferenceImages(result: ProposalAgentPrepareResp
 
   return finalDesignImages
     .slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES)
-    .map(({ image, referenceIndex }) => ({
-      id: `design-reference-${referenceIndex}-${image.url}`,
-      url: image.url,
-      filename: image.filename || image.raw_path || `${sourceLabel} ${referenceIndex}`,
-      label: requestedReferenceIndexSet.has(referenceIndex)
-        ? `开发思路指定${sourceLabel} ${referenceIndex}`
-        : `${sourceLabel} ${referenceIndex}`,
-      detail: requestedReferenceIndexSet.has(referenceIndex)
-        ? `开发思路指定${sourceLabel}${referenceIndex}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`
-        : `${sourceLabel}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`,
-      note: image.raw_path,
-      selectedByDesignRequirement: requestedReferenceIndexSet.has(referenceIndex),
-      designReferenceIndex: referenceIndex,
-      sourceField: image.source_field,
-    }));
+    .map(({ image, referenceIndex }) => {
+      const imageDirective = imageDirectiveMap.get(referenceIndex);
+      const designRequirementDirective = imageDirective?.directives.join('；') || '';
+      const designRequirementRoleList = imageDirective?.roles || [];
+      return {
+        id: `design-reference-${referenceIndex}-${image.url}`,
+        url: image.url,
+        filename: image.filename || image.raw_path || `${sourceLabel} ${referenceIndex}`,
+        label: requestedReferenceIndexSet.has(referenceIndex)
+          ? `开发思路指定${sourceLabel} ${referenceIndex}`
+          : `${sourceLabel} ${referenceIndex}`,
+        detail: requestedReferenceIndexSet.has(referenceIndex)
+          ? [
+              `开发思路指定${sourceLabel}${referenceIndex}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`,
+              designRequirementDirective
+                ? `具体要求：${designRequirementDirective}。必须按该图职责生成素材，不得与其他图的职责混用。`
+                : '',
+            ].filter(Boolean).join(' ')
+          : `${sourceLabel}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`,
+        note: image.raw_path,
+        selectedByDesignRequirement: requestedReferenceIndexSet.has(referenceIndex),
+        designReferenceIndex: referenceIndex,
+        designRequirementDirective,
+        designRequirementRoles: designRequirementRoleList,
+        sourceField: image.source_field,
+      };
+    });
 }
 
 function buildDesignReferenceMaterialSplitPrompt(
@@ -3040,6 +3148,7 @@ function buildDesignReferenceMaterialSplitPrompt(
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
   const designRequirementSummary =
     designRequirementDirectives.length > 0 ? designRequirementDirectives.join('；') : '';
+  const imageBindingSummary = designRequirementImageBindingSummary(images);
 
   return [
     `请基于输入的${sourceLabel}，只提取【${shapeLevel.title}】，整理成一张可用于后续图案设计的${shapeLevel.label}纯色背景素材图。`,
@@ -3052,6 +3161,9 @@ function buildDesignReferenceMaterialSplitPrompt(
     `来源${sourceLabel}：${sourceImageSummary(images)}。`,
     designRequirementSummary
       ? `开发思路设计指令：${designRequirementSummary}。这些信息只用于判断输入图中哪些现有元素值得提取，不用于生成输入图中不存在的新图案；尺寸、规格和载体信息不参与素材提取。`
+      : '',
+    imageBindingSummary
+      ? `开发思路图片职责绑定（必须逐图执行，不得混用）：\n${imageBindingSummary}`
       : '',
     buildMaterialShapeAnalysisInstruction(shapeAnalysis, shapeLevel),
     `元素/文字分层判定：${buildShapeLevelElementJudgment(shapeLevel, graphicElementSummary, textElementSummary)}`,
@@ -3122,6 +3234,17 @@ function sortFinalMaterialImagesByCategory(images: ImageToImageInputImage[]) {
 
     return first.id.localeCompare(second.id);
   });
+}
+
+function materialImagesForCategory(images: ImageToImageInputImage[], category: string) {
+  const normalizedCategory = category.trim().toLocaleLowerCase();
+  const scopedImages = images.filter((image) => (
+    image.category?.trim().toLocaleLowerCase() === normalizedCategory
+  ));
+  if (scopedImages.length > 0) {
+    return sortFinalMaterialImagesByCategory(scopedImages);
+  }
+  return sortFinalMaterialImagesByCategory(images.filter((image) => !image.category));
 }
 
 function ImageToImageInputPanel({
@@ -3366,11 +3489,11 @@ function ImageToImageInputPanel({
     window.setTimeout(() => setCopied(false), 1600);
   }
 
-  async function analyzeMaterialSourceShapes(force = false) {
+  async function analyzeMaterialSourceShapes(force = false, categoryOverride = trueCategory) {
     if (materialImages.length === 0) {
       throw new Error('当前没有可分析的图库/渠道素材图。');
     }
-    if (!force && materialShapeAnalysisResult?.status === 'success') {
+    if (!force && categoryOverride === trueCategory && materialShapeAnalysisResult?.status === 'success') {
       return materialShapeAnalysisResult;
     }
 
@@ -3381,7 +3504,7 @@ function ImageToImageInputPanel({
       const response = await analyzeMaterialShapeLevels({
         source_kind: 'material',
         project_code: result.project_code,
-        category: trueCategory,
+        category: categoryOverride,
         graphic_elements: graphicElements,
         text_elements: textElements,
         design_requirement_directives: designRequirementDirectives,
@@ -3403,11 +3526,11 @@ function ImageToImageInputPanel({
     }
   }
 
-  async function analyzeDesignReferenceShapes(force = false) {
+  async function analyzeDesignReferenceShapes(force = false, categoryOverride = trueCategory) {
     if (designReferenceImages.length === 0) {
       throw new Error(`当前没有可分析的${designReferenceSourceLabel}。`);
     }
-    if (!force && designReferenceShapeAnalysisResult?.status === 'success') {
+    if (!force && categoryOverride === trueCategory && designReferenceShapeAnalysisResult?.status === 'success') {
       return designReferenceShapeAnalysisResult;
     }
 
@@ -3418,7 +3541,7 @@ function ImageToImageInputPanel({
       const response = await analyzeMaterialShapeLevels({
         source_kind: 'design_reference',
         project_code: result.project_code,
-        category: trueCategory,
+        category: categoryOverride,
         graphic_elements: graphicElements,
         text_elements: textElements,
         design_requirement_directives: designRequirementDirectives,
@@ -3461,7 +3584,7 @@ function ImageToImageInputPanel({
     }
   }
 
-  async function reverseAndRegenerateUnifiedMaterialBoard({
+  async function reverseAndRegenerateDesignReferenceMaterial({
     sourceImage,
     sourceLabel,
     sourceNames,
@@ -3471,6 +3594,9 @@ function ImageToImageInputPanel({
     outputLabel,
     outputDetail,
     fallbackNote,
+    category,
+    materialKind,
+    generationSource,
   }: {
     sourceImage: ImageToImageInputImage;
     sourceLabel: string;
@@ -3481,25 +3607,39 @@ function ImageToImageInputPanel({
     outputLabel: string;
     outputDetail: string;
     fallbackNote: string;
+    category?: string;
+    materialKind: string;
+    generationSource: string;
   }) {
+    const targetCategory = category || trueCategory;
     const reverseResponse = await composeFinalPrompt({
-      template_prompt: buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis),
+      template_prompt: buildMaterialBoardReversePrompt(
+        sourceLabel,
+        sourceNames,
+        shapeAnalysis,
+        materialKind,
+      ),
       prompt_template_id: MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID,
       project_code: result.project_code,
-      category: trueCategory,
+      category: targetCategory,
       input_images: materialExtractionInputImages([sourceImage], 'material_board_reverse_source'),
     });
 
     if (reverseResponse.status !== 'success' || !reverseResponse.final_prompt) {
-      throw new Error(reverseResponse.ai_error?.message || 'AI 统一素材板提示词反推失败。');
+      throw new Error(reverseResponse.ai_error?.message || `AI ${materialKind}提示词反推失败。`);
     }
 
     const reverseDescription = reverseResponse.final_prompt;
     const regenerationResponse = await generatePatternImage({
-      prompt: buildMaterialBoardRegenerationPrompt(reverseDescription, sourceLabel, sourceNames),
+      prompt: buildMaterialBoardRegenerationPrompt(
+        reverseDescription,
+        sourceLabel,
+        sourceNames,
+        materialKind,
+      ),
       project_code: result.project_code,
-      category: trueCategory,
-      ...generationRunFields('element_image', 'design_reference_unified_regeneration', outputLabel),
+      category: targetCategory,
+      ...generationRunFields('element_image', generationSource, outputLabel),
       request_mode: 'images',
       input_images: [],
     });
@@ -3510,7 +3650,7 @@ function ImageToImageInputPanel({
 
     const regeneratedUrl = generatedImageUrl(regenerationResponse.images[0]);
     if (!regeneratedUrl) {
-      throw new Error('AI 统一素材板反推重生成没有返回可用图片。');
+      throw new Error(`AI ${materialKind}反推重生成没有返回可用图片。`);
     }
 
     return {
@@ -3524,29 +3664,44 @@ function ImageToImageInputPanel({
     };
   }
 
-  async function handleRefineMaterialImages(throwOnError = false): Promise<ImageToImageInputImage[]> {
+  async function handleRefineMaterialImages(
+    throwOnError = false,
+    categoryOverride = trueCategory,
+    updateVisibleState = true,
+    forceShapeAnalysis = false,
+  ): Promise<ImageToImageInputImage[]> {
     if (materialImages.length === 0) {
       return [];
     }
 
     setRefiningMaterials(true);
     setMaterialRefinementError(null);
-    setRefinedMaterialImages([]);
+    if (updateVisibleState) {
+      setRefinedMaterialImages([]);
+    }
 
     try {
-      const shapeAnalysis = await analyzeMaterialSourceShapes();
+      const shapeAnalysis = await analyzeMaterialSourceShapes(forceShapeAnalysis, categoryOverride);
       if (!materialShapeAnalysisRequiresSplit(shapeAnalysis)) {
         const response = await generatePatternImage({
-          prompt: buildUnifiedMaterialBoardPrompt(
-            materialImages,
-            graphicElements,
-            textElements,
-            shapeAnalysis,
-            '图库/渠道素材图',
-          ),
+          prompt: [
+            `目标真实品类：${categoryOverride}。本轮素材板只服务于该品类的完整设计任务。`,
+            buildUnifiedMaterialBoardPrompt(
+              materialImages,
+              graphicElements,
+              textElements,
+              shapeAnalysis,
+              '图库/渠道素材图',
+              designRequirementDirectives,
+            ),
+          ].join('\n'),
           project_code: result.project_code,
-          category: trueCategory,
-          ...generationRunFields('element_image', 'gallery_material_unified_cleanup', 'Unified material image'),
+          category: categoryOverride,
+          ...generationRunFields(
+            'element_image',
+            'gallery_material_unified_cleanup',
+            `${categoryOverride} · Unified material image`,
+          ),
           input_images: materialExtractionInputImages(materialImages, 'material_cleanup'),
         });
 
@@ -3562,31 +3717,42 @@ function ImageToImageInputPanel({
         const sourceNames = materialImages.map((image) => image.filename).join('、');
         const unifiedImage: ImageToImageInputImage = {
           ...materialImages[0],
-          id: `refined-unified-source-${result.project_code}`,
+          id: `refined-unified-source-${result.project_code}-${categoryOverride}`,
           url: cleanedUrl,
-          filename: `AI处理素材-统一素材板-${result.project_code}.png`,
-          label: 'AI处理素材-统一素材板',
-          detail: `统一素材板；AI 判断不需要拆分一级形/二级形/三级形，仅清理标注和载体信息；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}；内部图库素材不做提示词反推文生图，直接作为最终素材图使用。`,
+          filename: `AI处理素材-${categoryOverride}-统一素材板-${result.project_code}.png`,
+          label: `AI处理素材-${categoryOverride}-统一素材板`,
+          detail: `${categoryOverride}品类统一素材板；AI 判断不需要拆分一级形/二级形/三级形，仅清理标注和载体信息；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}；内部图库素材不做提示词反推文生图，直接作为该品类最终素材图使用。`,
           note: response.images[0].revised_prompt || '最终生成将直接使用这张统一清理后的内部素材板。',
+          category: categoryOverride,
         };
         const nextRefinedImages = [unifiedImage];
-        setRefinedMaterialImages(nextRefinedImages);
+        if (updateVisibleState) {
+          setRefinedMaterialImages(nextRefinedImages);
+        }
         return nextRefinedImages;
       }
 
       const refinedImages: ImageToImageInputImage[] = [];
       for (const [levelIndex, shapeLevel] of MATERIAL_SHAPE_LEVELS.entries()) {
         const response = await generatePatternImage({
-          prompt: buildMaterialRefinementPrompt(
-            materialImages,
-            graphicElements,
-            textElements,
-            shapeLevel,
-            shapeAnalysis,
-          ),
+          prompt: [
+            `目标真实品类：${categoryOverride}。本轮${shapeLevel.label}素材只服务于该品类的完整设计任务。`,
+            buildMaterialRefinementPrompt(
+              materialImages,
+              graphicElements,
+              textElements,
+              shapeLevel,
+              shapeAnalysis,
+              designRequirementDirectives,
+            ),
+          ].join('\n'),
           project_code: result.project_code,
-          category: trueCategory,
-          ...generationRunFields('element_image', 'gallery_material_split_cleanup', shapeLevel.label),
+          category: categoryOverride,
+          ...generationRunFields(
+            'element_image',
+            'gallery_material_split_cleanup',
+            `${categoryOverride} · ${shapeLevel.label}`,
+          ),
           input_images: materialExtractionInputImages(materialImages, 'material_cleanup'),
         });
 
@@ -3602,17 +3768,20 @@ function ImageToImageInputPanel({
         const sourceNames = materialImages.map((image) => image.filename).join('、');
         refinedImages.push({
           ...materialImages[0],
-          id: `refined-${shapeLevel.key}-${result.project_code}-${levelIndex}`,
+          id: `refined-${shapeLevel.key}-${result.project_code}-${categoryOverride}-${levelIndex}`,
           url: cleanedUrl,
-          filename: `AI处理素材-${shapeLevel.label}-${result.project_code}.png`,
-          label: `AI处理素材-${shapeLevel.label}`,
-          detail: `${shapeLevel.label}分层素材；AI 已先判断一二三级形并去除载体、标注和渠道信息；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}；只作为最终素材图使用。`,
+          filename: `AI处理素材-${categoryOverride}-${shapeLevel.label}-${result.project_code}.png`,
+          label: `AI处理素材-${categoryOverride}-${shapeLevel.label}`,
+          detail: `${categoryOverride}品类${shapeLevel.label}分层素材；AI 已先判断一二三级形并去除载体、标注和渠道信息；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}；只作为该品类最终素材图使用。`,
           note: response.images[0].revised_prompt || '最终生成将优先使用这张处理后的素材图。',
           materialShapeLevel: shapeLevel.key,
+          category: categoryOverride,
         });
       }
 
-      setRefinedMaterialImages(refinedImages);
+      if (updateVisibleState) {
+        setRefinedMaterialImages(refinedImages);
+      }
       return refinedImages;
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'AI 素材处理失败。';
@@ -3626,7 +3795,11 @@ function ImageToImageInputPanel({
     }
   }
 
-  async function splitDesignReferenceImages() {
+  async function splitDesignReferenceImages(
+    categoryOverride = trueCategory,
+    updateVisibleState = true,
+    forceShapeAnalysis = false,
+  ) {
     if (!canSplitDesignReferences) {
       return [];
     }
@@ -3635,21 +3808,28 @@ function ImageToImageInputPanel({
     setDesignReferenceSplitError(null);
 
     try {
-      const shapeAnalysis = await analyzeDesignReferenceShapes();
+      const shapeAnalysis = await analyzeDesignReferenceShapes(forceShapeAnalysis, categoryOverride);
       if (!materialShapeAnalysisRequiresSplit(shapeAnalysis)) {
         const referenceSourceLabel = generationReferenceSourceLabel(designReferenceImages);
         const response = await generatePatternImage({
-          prompt: buildUnifiedMaterialBoardPrompt(
-            designReferenceImages,
-            graphicElements,
-            textElements,
-            shapeAnalysis,
-            referenceSourceLabel,
-            designRequirementDirectives,
-          ),
+          prompt: [
+            `目标真实品类：${categoryOverride}。本轮素材板只服务于该品类的完整设计任务。`,
+            buildUnifiedMaterialBoardPrompt(
+              designReferenceImages,
+              graphicElements,
+              textElements,
+              shapeAnalysis,
+              referenceSourceLabel,
+              designRequirementDirectives,
+            ),
+          ].join('\n'),
           project_code: result.project_code,
-          category: trueCategory,
-          ...generationRunFields('element_image', 'company_design_reference_unified_split', 'Unified design reference material'),
+          category: categoryOverride,
+          ...generationRunFields(
+            'element_image',
+            'company_design_reference_unified_split',
+            `${categoryOverride} · Unified design reference material`,
+          ),
           input_images: materialExtractionInputImages(
             designReferenceImages,
             'design_reference_material_source',
@@ -3668,25 +3848,32 @@ function ImageToImageInputPanel({
         const sourceNames = designReferenceImages.map((image) => image.filename).join('、');
         const unifiedImage: ImageToImageInputImage = {
           ...designReferenceImages[0],
-          id: `split-design-reference-unified-source-${result.project_code}`,
+          id: `split-design-reference-unified-source-${result.project_code}-${categoryOverride}`,
           url: splitUrl,
-          filename: `AI提取素材-统一素材板-${result.project_code}.png`,
-          label: 'AI提取素材-统一素材板',
-          detail: `统一素材板；AI 判断不需要拆分一级形/二级形/三级形，并从${referenceSourceLabel}提取可用图案素材；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为最终素材图使用。`,
+          filename: `AI提取素材-${categoryOverride}-统一素材板-${result.project_code}.png`,
+          label: `AI提取素材-${categoryOverride}-统一素材板`,
+          detail: `${categoryOverride}品类统一素材板；AI 判断不需要拆分一级形/二级形/三级形，并从${referenceSourceLabel}提取可用图案素材；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为该品类最终素材图使用。`,
           note: response.images[0].revised_prompt || `最终生成会使用这张统一清理后的素材板，不使用原始${referenceSourceLabel}。`,
+          category: categoryOverride,
         };
-        const regeneratedUnifiedImage = await reverseAndRegenerateUnifiedMaterialBoard({
+        const regeneratedUnifiedImage = await reverseAndRegenerateDesignReferenceMaterial({
           sourceImage: unifiedImage,
           sourceLabel: `${referenceSourceLabel}统一素材板`,
           sourceNames,
           shapeAnalysis,
-          outputId: `split-design-reference-unified-regenerated-${result.project_code}`,
-          outputFilename: `AI提取素材-反推重生成统一素材板-${result.project_code}.png`,
-          outputLabel: 'AI提取素材-反推统一素材板',
-          outputDetail: `统一素材板；AI 判断不需要拆分一级形/二级形/三级形，已从${referenceSourceLabel}提取可用素材并完成提示词反推重生成；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为最终素材图使用。`,
+          outputId: `split-design-reference-unified-regenerated-${result.project_code}-${categoryOverride}`,
+          outputFilename: `AI提取素材-${categoryOverride}-反推重生成统一素材板-${result.project_code}.png`,
+          outputLabel: `${categoryOverride} · AI提取素材-反推统一素材板`,
+          outputDetail: `${categoryOverride}品类统一素材板；AI 判断不需要拆分一级形/二级形/三级形，已从${referenceSourceLabel}提取可用素材并完成提示词反推重生成；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为该品类最终素材图使用。`,
           fallbackNote: `最终生成会使用这张反推重生成后的统一素材板，不使用原始${referenceSourceLabel}。`,
+          category: categoryOverride,
+          materialKind: '统一素材板',
+          generationSource: 'design_reference_unified_regeneration',
         });
-        setSplitDesignReferenceMaterials([regeneratedUnifiedImage]);
+        regeneratedUnifiedImage.category = categoryOverride;
+        if (updateVisibleState) {
+          setSplitDesignReferenceMaterials([regeneratedUnifiedImage]);
+        }
         return [regeneratedUnifiedImage];
       }
 
@@ -3694,17 +3881,24 @@ function ImageToImageInputPanel({
       for (const [levelIndex, shapeLevel] of MATERIAL_SHAPE_LEVELS.entries()) {
         const referenceSourceLabel = generationReferenceSourceLabel(designReferenceImages);
         const response = await generatePatternImage({
-          prompt: buildDesignReferenceMaterialSplitPrompt(
-            designReferenceImages,
-            graphicElements,
-            textElements,
-            shapeLevel,
-            designRequirementDirectives,
-            shapeAnalysis,
-          ),
+          prompt: [
+            `目标真实品类：${categoryOverride}。本轮${shapeLevel.label}素材只服务于该品类的完整设计任务。`,
+            buildDesignReferenceMaterialSplitPrompt(
+              designReferenceImages,
+              graphicElements,
+              textElements,
+              shapeLevel,
+              designRequirementDirectives,
+              shapeAnalysis,
+            ),
+          ].join('\n'),
           project_code: result.project_code,
-          category: trueCategory,
-          ...generationRunFields('element_image', 'company_design_reference_split', shapeLevel.label),
+          category: categoryOverride,
+          ...generationRunFields(
+            'element_image',
+            'company_design_reference_split',
+            `${categoryOverride} · ${shapeLevel.label}`,
+          ),
           input_images: materialExtractionInputImages(
             designReferenceImages,
             'design_reference_material_source',
@@ -3721,20 +3915,40 @@ function ImageToImageInputPanel({
         }
 
         const sourceNames = designReferenceImages.map((image) => image.filename).join('、');
-        splitImages.push({
+        const extractedLayerImage: ImageToImageInputImage = {
           ...designReferenceImages[0],
-          id: `split-design-reference-${shapeLevel.key}-${result.project_code}-${levelIndex}`,
+          id: `split-design-reference-${shapeLevel.key}-${result.project_code}-${categoryOverride}-${levelIndex}`,
           url: splitUrl,
-          filename: `AI提取素材-${shapeLevel.label}-${result.project_code}.png`,
-          label: `AI提取素材-${shapeLevel.label}`,
-          detail: `${shapeLevel.label}分层素材；AI 已先判断一二三级形，并从${referenceSourceLabel}提取可用图案素材；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为最终素材图使用。`,
+          filename: `AI提取素材-${categoryOverride}-${shapeLevel.label}-${result.project_code}.png`,
+          label: `AI提取素材-${categoryOverride}-${shapeLevel.label}`,
+          detail: `${categoryOverride}品类${shapeLevel.label}分层素材；AI 已先判断一二三级形，并从${referenceSourceLabel}提取可用图案素材；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。只作为该品类最终素材图使用。`,
           note: response.images[0].revised_prompt || `最终生成会使用这张提取后的素材图，不使用原始${referenceSourceLabel}。`,
           materialShapeLevel: shapeLevel.key,
+          category: categoryOverride,
+        };
+        const regeneratedLayerImage = await reverseAndRegenerateDesignReferenceMaterial({
+          sourceImage: extractedLayerImage,
+          sourceLabel: `${referenceSourceLabel}${shapeLevel.label}`,
+          sourceNames,
+          shapeAnalysis,
+          outputId: `split-design-reference-regenerated-${shapeLevel.key}-${result.project_code}-${categoryOverride}-${levelIndex}`,
+          outputFilename: `AI提取素材-${categoryOverride}-反推重生成-${shapeLevel.label}-${result.project_code}.png`,
+          outputLabel: `${categoryOverride} · AI提取素材-反推${shapeLevel.label}`,
+          outputDetail: `${categoryOverride}品类${shapeLevel.label}分层素材；已从${referenceSourceLabel}提取素材、逐张反推视觉描述并使用纯文本重新生成；来源：${sourceNames}；判断：${materialShapeAnalysisSummary(shapeAnalysis)}。最终只使用反推重生成图片。`,
+          fallbackNote: `最终生成会使用这张反推重生成后的${shapeLevel.label}素材图，不使用原始${referenceSourceLabel}或第一次提取图。`,
+          category: categoryOverride,
+          materialKind: `${shapeLevel.label}素材图`,
+          generationSource: 'design_reference_split_regeneration',
         });
+        regeneratedLayerImage.materialShapeLevel = shapeLevel.key;
+        regeneratedLayerImage.category = categoryOverride;
+        splitImages.push(regeneratedLayerImage);
       }
 
       const nextSplitImages = splitImages;
-      setSplitDesignReferenceMaterials(nextSplitImages);
+      if (updateVisibleState) {
+        setSplitDesignReferenceMaterials(nextSplitImages);
+      }
       return nextSplitImages;
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'AI 设计参考图素材提取失败。';
@@ -3753,11 +3967,22 @@ function ImageToImageInputPanel({
     }
   }
 
-  async function extractHistoryLayoutImage() {
-    if (!sourceHistoryImage) {
+  async function extractHistoryLayoutImage(
+    historySourceOverride: ImageToImageInputImage | null = sourceHistoryImage,
+    categoryOverride = trueCategory,
+    updateVisibleState = true,
+    force = false,
+  ) {
+    if (!historySourceOverride) {
       return null;
     }
-    if (extractedHistoryLayoutImage) {
+    const canReuseVisibleLayout = Boolean(
+      !force &&
+      extractedHistoryLayoutImage &&
+      extractedHistoryLayoutImage.category === categoryOverride &&
+      extractedHistoryLayoutImage.id === `layout-only-${historySourceOverride.id}-${categoryOverride}`,
+    );
+    if (canReuseVisibleLayout) {
       return extractedHistoryLayoutImage;
     }
 
@@ -3766,17 +3991,22 @@ function ImageToImageInputPanel({
 
     try {
       const response = await generatePatternImage({
-        prompt: buildHistoryLayoutExtractionPrompt(sourceHistoryImage),
+        prompt: buildHistoryLayoutExtractionPrompt(historySourceOverride),
         project_code: result.project_code,
-        category: trueCategory,
+        category: categoryOverride,
+        ...generationRunFields(
+          'element_image',
+          'history_layout_extraction',
+          `${categoryOverride} · AI 空版式母版`,
+        ),
         input_images: [
           {
-            id: sourceHistoryImage.id,
+            id: historySourceOverride.id,
             role: 'history_layout_source',
-            label: sourceHistoryImage.label,
-            filename: sourceHistoryImage.filename,
-            url: sourceHistoryImage.url,
-            detail: sourceHistoryImage.detail,
+            label: historySourceOverride.label,
+            filename: historySourceOverride.filename,
+            url: historySourceOverride.url,
+            detail: historySourceOverride.detail,
           },
         ],
       });
@@ -3791,16 +4021,19 @@ function ImageToImageInputPanel({
       }
 
       const nextHistoryLayoutImage: ImageToImageInputImage = {
-        ...sourceHistoryImage,
-        id: `layout-only-${sourceHistoryImage.id}`,
+        ...historySourceOverride,
+        id: `layout-only-${historySourceOverride.id}-${categoryOverride}`,
         url: layoutUrl,
-        filename: `AI空版式母版-${sourceHistoryImage.filename}`,
-        label: 'AI历史空版式母版',
-        detail: `AI 已清空历史设计图旧文字、旧图案、旧主题和旧配色；来源：${sourceHistoryImage.filename}。只保留版式结构作为最终构图母版。`,
+        filename: `AI空版式母版-${categoryOverride}-${historySourceOverride.filename}`,
+        label: `AI历史空版式母版-${categoryOverride}`,
+        detail: `AI 已为${categoryOverride}品类清空历史设计图旧文字、旧图案、旧主题和旧配色；来源：${historySourceOverride.filename}。只保留版式结构作为该品类最终构图母版。`,
         note: response.images[0].revised_prompt || '最终生成会使用这张空版式母版，不使用带旧内容的原始历史设计图。',
+        category: categoryOverride,
       };
 
-      setExtractedHistoryLayoutImage(nextHistoryLayoutImage);
+      if (updateVisibleState) {
+        setExtractedHistoryLayoutImage(nextHistoryLayoutImage);
+      }
       return nextHistoryLayoutImage;
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : 'AI 历史空版式提取失败。';
@@ -4031,30 +4264,68 @@ function ImageToImageInputPanel({
     setAgentFlowSteps(createAgentFlowSteps());
 
     try {
-      const nextRefinedImages = materialImages.length > 0
-        ? await runAgentStep('material', '素材图处理', () => handleRefineMaterialImages(true))
-        : [];
+      const primaryHistoryImage = options.manualHistoryImage || sourceHistoryImage;
+      const generationCategoryTargets = finalCategoryTargetsForGeneration(primaryHistoryImage || null);
+      const categoryMaterialGroups: Array<{
+        target: CategoryGenerationTarget;
+        materials: ImageToImageInputImage[];
+      }> = [];
+      const allRefinedImages: ImageToImageInputImage[] = [];
+      const allDesignReferenceMaterials: ImageToImageInputImage[] = [];
+
+      for (const target of generationCategoryTargets) {
+        const nextRefinedImages = materialImages.length > 0
+          ? await runAgentStep(
+            'material',
+            `${target.category} 素材图处理`,
+            () => handleRefineMaterialImages(true, target.category, false, true),
+          )
+          : [];
+        const nextDesignReferenceMaterials = canSplitDesignReferences
+          ? await runAgentStep(
+            'reference',
+            `${target.category} 设计参考图素材提取`,
+            () => splitDesignReferenceImages(target.category, false, true),
+          )
+          : [];
+        const generationMaterialImages = combineFinalMaterialImages(
+          nextRefinedImages,
+          nextDesignReferenceMaterials,
+        );
+
+        if (generationMaterialImages.length === 0) {
+          updateAgentFlowStep('material', 'blocked', `${target.category} 没有可输出的素材图，流程无法继续。`);
+          setAgentFlowStatus('blocked');
+          setAgentFlowError(
+            `${target.category} 没有可用素材图：图库素材和设计参考图都没有形成最终素材。`,
+          );
+          return;
+        }
+
+        allRefinedImages.push(...nextRefinedImages);
+        allDesignReferenceMaterials.push(...nextDesignReferenceMaterials);
+        categoryMaterialGroups.push({ target, materials: generationMaterialImages });
+      }
+
+      setRefinedMaterialImages(allRefinedImages);
+      setSplitDesignReferenceMaterials(allDesignReferenceMaterials);
       if (materialImages.length === 0) {
         skipAgentStep('material', '没有命中的内部图库素材。');
+      } else {
+        updateAgentFlowStep(
+          'material',
+          'success',
+          `已按 ${generationCategoryTargets.length} 个品类分别完成图库素材处理。`,
+        );
       }
-
-      const nextDesignReferenceMaterials = canSplitDesignReferences
-        ? await runAgentStep('reference', '设计参考图素材提取', () => splitDesignReferenceImages())
-        : [];
       if (!canSplitDesignReferences) {
         skipAgentStep('reference', '没有需要进入素材池的设计参考图。');
-      }
-
-      const generationMaterialImages = combineFinalMaterialImages(
-        nextRefinedImages.length > 0 ? nextRefinedImages : refinedMaterialImages,
-        nextDesignReferenceMaterials.length > 0 ? nextDesignReferenceMaterials : splitDesignReferenceMaterials,
-      );
-
-      if (generationMaterialImages.length === 0) {
-        updateAgentFlowStep('material', 'blocked', '没有可输出的素材图，流程无法继续。');
-        setAgentFlowStatus('blocked');
-        setAgentFlowError('没有可用素材图：图库素材和设计参考图都没有形成最终素材。');
-        return;
+      } else {
+        updateAgentFlowStep(
+          'reference',
+          'success',
+          `已按 ${generationCategoryTargets.length} 个品类分别完成设计参考图素材提取。`,
+        );
       }
 
       if (options.materialsOnly) {
@@ -4066,8 +4337,6 @@ function ImageToImageInputPanel({
         return;
       }
 
-      const primaryHistoryImage = options.manualHistoryImage || finalHistoryImage;
-      const generationCategoryTargets = finalCategoryTargetsForGeneration(primaryHistoryImage || null);
       const missingHistoryTargets = generationCategoryTargets.filter((target) => !target.historyImage);
       if (missingHistoryTargets.length > 0 && !options.continueWithoutHistory) {
         updateAgentFlowStep(
@@ -4082,6 +4351,33 @@ function ImageToImageInputPanel({
           `缺少历史设计图：请上传空版式母版，或选择只输出素材图。缺少品类：${missingHistoryTargets.map((target) => target.category).join('、')}。`,
         );
         return;
+      }
+
+      if (useHistoryLayoutExtraction) {
+        let firstExtractedHistoryImage: ImageToImageInputImage | null = null;
+        for (const group of categoryMaterialGroups) {
+          if (!group.target.historyImage) {
+            continue;
+          }
+          const extractedLayout = await runAgentStep(
+            'layout',
+            `${group.target.category} AI 空版式母版提取`,
+            () => extractHistoryLayoutImage(
+              group.target.historyImage,
+              group.target.category,
+              false,
+              group.target.category !== trueCategory,
+            ),
+          );
+          group.target = {
+            ...group.target,
+            historyImage: extractedLayout,
+          };
+          firstExtractedHistoryImage ||= extractedLayout;
+        }
+        if (firstExtractedHistoryImage) {
+          setExtractedHistoryLayoutImage(firstExtractedHistoryImage);
+        }
       }
 
       if (generationCategoryTargets.some((target) => target.historyImage)) {
@@ -4099,35 +4395,76 @@ function ImageToImageInputPanel({
         updateAgentFlowStep('layout', 'skipped', '用户选择无版式继续生成。', 0);
       }
 
-      const composedRequests = await runAgentStep('prompt', '最终提示词编写', async () => {
-        const requests: Array<{
-          target: CategoryGenerationTarget;
-          finalPromptResponse: ComposeFinalPromptResponse;
-          inputImages: GeneratePatternImageInputImage[];
-        }> = [];
+      const composedRequests: Array<{
+        target: CategoryGenerationTarget;
+        finalPromptResponse: ComposeFinalPromptResponse;
+        inputImages: GeneratePatternImageInputImage[];
+      }> = [];
+      const generationResponses: Array<{
+        target: CategoryGenerationTarget;
+        response: GeneratePatternImageResponse;
+      }> = [];
 
-        for (const target of generationCategoryTargets) {
-          const targetHistoryImage = target.historyImage || null;
-          const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
-            generationMaterialImages,
-            targetHistoryImage,
-            target.category,
-          );
-          const finalPromptResponse = await composeTrueFinalPrompt(
-            generationMaterialImages,
+      for (const group of categoryMaterialGroups) {
+        const targetHistoryImage = group.target.historyImage || null;
+        const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
+          group.materials,
+          targetHistoryImage,
+          group.target.category,
+        );
+        const finalPromptResponse = await runAgentStep(
+          'prompt',
+          `${group.target.category} 最终提示词编写`,
+          () => composeTrueFinalPrompt(
+            group.materials,
             targetHistoryImage,
             generationTemplatePrompt,
-            target.category,
-          );
-          requests.push({
-            target,
-            finalPromptResponse,
-            inputImages: buildFinalGenerationInputImages(targetHistoryImage, generationMaterialImages),
-          });
-        }
+            group.target.category,
+          ),
+        );
+        const inputImages = buildFinalGenerationInputImages(targetHistoryImage, group.materials);
+        composedRequests.push({
+          target: group.target,
+          finalPromptResponse,
+          inputImages,
+        });
 
-        return requests;
-      });
+        const generationResponse = await runAgentStep(
+          'generate',
+          `${group.target.category} 最终图生图`,
+          async () => {
+            const response = await generatePatternImage({
+              prompt: finalPromptResponse.final_prompt,
+              project_code: result.project_code,
+              category: group.target.category,
+              ...generationRunFields(
+                'final_design',
+                'automated_flow_final_generation',
+                `Final generated design - ${group.target.category}`,
+              ),
+              history_layout_lock_policy: finalPromptResponse.history_layout_lock_policy,
+              history_layout_lock_reason: finalPromptResponse.history_layout_lock_reason,
+              input_images: inputImages,
+            });
+            if (response.status !== 'success') {
+              throw new Error(response.ai_error?.message || imageGenerationStatusHint(response));
+            }
+            return response;
+          },
+        );
+        generationResponses.push({ target: group.target, response: generationResponse });
+      }
+
+      updateAgentFlowStep(
+        'prompt',
+        'success',
+        `已按 ${composedRequests.length} 个品类分别完成最终提示词。`,
+      );
+      updateAgentFlowStep(
+        'generate',
+        'success',
+        `已按 ${generationResponses.length} 个品类分别完成最终生图。`,
+      );
       const submittedRequests = composedRequests.map((item) => ({
         category: item.target.category,
         prompt: item.finalPromptResponse.final_prompt,
@@ -4148,38 +4485,6 @@ function ImageToImageInputPanel({
         historyLayoutLockReason: submittedRequests[0]?.historyLayoutLockReason,
         createdAt: new Date().toISOString(),
       });
-      const generationResponses = await runAgentStep('generate', '最终图生图', async () => {
-        const responses: Array<{
-          target: CategoryGenerationTarget;
-          response: GeneratePatternImageResponse;
-        }> = [];
-
-        for (const item of composedRequests) {
-          const generationResponse = await generatePatternImage({
-            prompt: item.finalPromptResponse.final_prompt,
-            project_code: result.project_code,
-            category: item.target.category,
-            ...generationRunFields(
-              'final_design',
-              'automated_flow_final_generation',
-              `Final generated design - ${item.target.category}`,
-            ),
-            history_layout_lock_policy: item.finalPromptResponse.history_layout_lock_policy,
-            history_layout_lock_reason: item.finalPromptResponse.history_layout_lock_reason,
-            input_images: item.inputImages,
-          });
-          if (generationResponse.status !== 'success') {
-            throw new Error(generationResponse.ai_error?.message || imageGenerationStatusHint(generationResponse));
-          }
-          responses.push({
-            target: item.target,
-            response: generationResponse,
-          });
-        }
-
-        return responses;
-      });
-
       const firstResponse = generationResponses[0]?.response;
       if (!firstResponse) {
         throw new Error('最终图生图没有返回任何品类结果。');
@@ -4249,13 +4554,17 @@ function ImageToImageInputPanel({
       const composedRequests = [];
       for (const target of generationCategoryTargets) {
         const targetHistoryImage = target.historyImage || generationHistoryImage;
-        const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
+        const targetMaterialImages = materialImagesForCategory(
           generationMaterialImages,
+          target.category,
+        );
+        const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
+          targetMaterialImages,
           targetHistoryImage,
           target.category,
         );
         const finalPromptResponse = await composeTrueFinalPrompt(
-          generationMaterialImages,
+          targetMaterialImages,
           targetHistoryImage,
           generationTemplatePrompt,
           target.category,
@@ -4263,7 +4572,7 @@ function ImageToImageInputPanel({
         composedRequests.push({
           category: target.category,
           prompt: finalPromptResponse.final_prompt,
-          inputImages: buildFinalGenerationInputImages(targetHistoryImage, generationMaterialImages),
+          inputImages: buildFinalGenerationInputImages(targetHistoryImage, targetMaterialImages),
           historyLayoutLockPolicy: finalPromptResponse.history_layout_lock_policy,
           historyLayoutLockReason: finalPromptResponse.history_layout_lock_reason,
         });
@@ -4306,13 +4615,17 @@ function ImageToImageInputPanel({
       const composedRequests = [];
       for (const target of generationCategoryTargets) {
         const targetHistoryImage = target.historyImage || generationHistoryImage;
-        const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
+        const targetMaterialImages = materialImagesForCategory(
           generationMaterialImages,
+          target.category,
+        );
+        const generationTemplatePrompt = buildFinalGenerationTemplatePrompt(
+          targetMaterialImages,
           targetHistoryImage,
           target.category,
         );
         const finalPromptResponse = await composeTrueFinalPrompt(
-          generationMaterialImages,
+          targetMaterialImages,
           targetHistoryImage,
           generationTemplatePrompt,
           target.category,
@@ -4320,7 +4633,7 @@ function ImageToImageInputPanel({
         composedRequests.push({
           target,
           finalPromptResponse,
-          inputImages: buildFinalGenerationInputImages(targetHistoryImage, generationMaterialImages),
+          inputImages: buildFinalGenerationInputImages(targetHistoryImage, targetMaterialImages),
         });
       }
       setLastGenerationInput({

@@ -215,6 +215,7 @@ function projectRunSummary(run) {
     status: run.status,
     createdAt: run.createdAt,
     updatedAt: run.updatedAt,
+    flowVersion: cleanString(run.flowVersion),
     elementImages: Array.isArray(run.elementImages) ? run.elementImages : [],
     finalDesignImages: Array.isArray(run.finalDesignImages) ? run.finalDesignImages : [],
     project: run.project && typeof run.project === 'object' ? run.project : null,
@@ -276,6 +277,7 @@ function buildImageRecord(image, context, options = {}) {
   return {
     id: `img_${hashValue([context.runId, context.stage, context.index, imageUrl].join('|'))}`,
     projectCode: context.projectCode,
+    category: cleanString(context.request.category),
     runId: context.runId,
     status: 'completed',
     stage: context.stage,
@@ -356,6 +358,7 @@ function recordProjectGenerationResult(request = {}, result = {}, options = {}) 
       model: result.model,
       requestMode: result.request_mode,
       inputImageCount: Number(result.input_image_count) || 0,
+      category: cleanString(request.category),
       createdAt: run.updatedAt,
     },
   ].slice(-MAX_STORED_EVENTS);
@@ -380,6 +383,9 @@ function recordProjectRunMetadata(request = {}, metadata = {}, options = {}) {
   }
   if (metadata.projectDataLayer && typeof metadata.projectDataLayer === 'object') {
     run.projectDataLayer = metadata.projectDataLayer;
+  }
+  if (cleanString(metadata.flowVersion)) {
+    run.flowVersion = cleanString(metadata.flowVersion);
   }
 
   run.updatedAt = nowIso();

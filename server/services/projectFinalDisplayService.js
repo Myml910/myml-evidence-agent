@@ -25,6 +25,7 @@ const {
 
 const FINAL_DISPLAY_PROMPT_TEMPLATE_ID = 'structured_ai';
 const FINAL_DISPLAY_FINAL_GENERATION_SOURCE = 'automated_flow_final_generation';
+const FINAL_DISPLAY_FLOW_VERSION = 'category_full_v1';
 const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID = 'material_board_reverse';
 const GENERATION_MATERIAL_MIN_SCORE = 0.8;
 const AGENT_FLOW_MAX_RETRIES = 3;
@@ -245,6 +246,11 @@ function cleanString(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function categoryScopedGenerationLabel(category, label) {
+  const cleanCategory = cleanString(category) || 'uncategorized';
+  return `${cleanCategory} · ${cleanString(label) || 'Generated image'}`;
+}
+
 function finalDisplayRequestId(request) {
   return cleanString(
     request?.body?.requestId ||
@@ -415,18 +421,17 @@ function parseChineseReferenceNumber(value) {
   return 0;
 }
 
-function collectDesignRequirementReferenceIndices(proposal = {}) {
-  const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
+function referenceIndicesFromRequirementText(value) {
   const indices = new Set();
   const referenceNumberGroupPattern = /[0-9]+|[一二两三四五六七八九十]+/g;
   const patterns = [
-    /参考\s*(?:图|图片)\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
-    /(?:见|看|按|按照|根据)\s*(?:设计)?\s*参考?\s*(?:图|图片)\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
+    /(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*([0-9一二两三四五六七八九十、,，和及\s]+)/g,
+    /第\s*([0-9一二两三四五六七八九十]+)\s*(?:张)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)/g,
     /(?:style|reference|ref)\s*(?:image|img|fig|figure)?\s*#?\s*([0-9,\s]+)/gi,
   ];
 
   for (const pattern of patterns) {
-    let match = pattern.exec(designRequirement);
+    let match = pattern.exec(String(value || ''));
     while (match) {
       const numberGroup = match[1] || '';
       const numberMatches = numberGroup.match(referenceNumberGroupPattern) || [];
@@ -436,11 +441,63 @@ function collectDesignRequirementReferenceIndices(proposal = {}) {
           indices.add(parsed);
         }
       }
-      match = pattern.exec(designRequirement);
+      match = pattern.exec(String(value || ''));
     }
   }
 
   return Array.from(indices).sort((left, right) => left - right);
+}
+
+function designRequirementRoles(value) {
+  const roles = [];
+  if (/(形状|外形|轮廓|刀模|款式)/i.test(value)) roles.push('shape/outline reference');
+  if (/(图案|主体|主图|元素|装饰|角色)/i.test(value)) roles.push('motif material reference');
+  if (/(排版|布局|版式|位置|一面|另一面)/i.test(value)) roles.push('layout/placement reference');
+  if (/(文案|文字|字体|字形|标题)/i.test(value)) roles.push('text/lettering reference');
+  if (/(配色|颜色|色系|底色|背景|黑色|白色|紫色|蓝色|粉色|红色|绿色|黄色|橙色)/i.test(value)) roles.push('color/background reference');
+  if (/(风格|可爱|卡通|童趣|复古|简约|高端|酷|温馨)/i.test(value)) roles.push('style reference');
+  return Array.from(new Set(roles.length > 0 ? roles : ['development requirement reference']));
+}
+
+function collectDesignRequirementImageDirectives(proposal = {}) {
+  const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
+  const directiveMap = new Map();
+  const fragments = designRequirement
+    .replace(/\r?\n/g, '，')
+    .split(/[，,；;。.!！?？]+/)
+    .map((fragment) => fragment.trim())
+    .filter(Boolean);
+
+  fragments.forEach((fragment, index) => {
+    const referenceIndices = referenceIndicesFromRequirementText(fragment);
+    if (referenceIndices.length === 0) return;
+    const previousFragment = fragments[index - 1] || '';
+    const referenceOnly = /^(?:见|看|参考|按|按照|跟|根据)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*[0-9一二两三四五六七八九十、,，和及\s]+$/i.test(fragment);
+    const directive = (
+      referenceOnly && previousFragment && referenceIndicesFromRequirementText(previousFragment).length === 0
+        ? `${previousFragment}，${fragment}`
+        : fragment
+    ).slice(0, 240);
+    const roles = designRequirementRoles(directive);
+    referenceIndices.forEach((referenceIndex) => {
+      const current = directiveMap.get(referenceIndex) || { directives: [], roles: [] };
+      directiveMap.set(referenceIndex, {
+        directives: Array.from(new Set([...current.directives, directive])),
+        roles: Array.from(new Set([...current.roles, ...roles])),
+      });
+    });
+  });
+
+  return directiveMap;
+}
+
+function collectDesignRequirementReferenceIndices(proposal = {}) {
+  const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
+  const directiveIndices = Array.from(collectDesignRequirementImageDirectives(proposal).keys());
+  return Array.from(new Set([
+    ...directiveIndices,
+    ...referenceIndicesFromRequirementText(designRequirement),
+  ])).sort((left, right) => left - right);
 }
 
 function projectPreviewFromLookup(result) {
@@ -500,6 +557,7 @@ function designReferenceImagesFromLookup(result) {
   const sourceLabel = designImages.length > 0 ? 'Company design reference' : 'External evidence reference';
   const requestedIndices = collectDesignRequirementReferenceIndices(proposal);
   const requestedIndexSet = new Set(requestedIndices);
+  const imageDirectiveMap = collectDesignRequirementImageDirectives(proposal);
   const indexedImages = sourceImages
     .filter((image) => safeImageUrl(image.url))
     .map((image, index) => ({
@@ -518,6 +576,9 @@ function designReferenceImagesFromLookup(result) {
     .map(({ image, referenceIndex }) => {
       const imageUrl = safeImageUrl(image.url);
       if (!imageUrl) return null;
+      const imageDirective = imageDirectiveMap.get(referenceIndex);
+      const designRequirementDirective = imageDirective?.directives.join('; ') || '';
+      const designRequirementRoleList = imageDirective?.roles || [];
       return {
         id: `company_design_reference_${projectCode}_${referenceIndex}`,
         projectCode,
@@ -530,6 +591,8 @@ function designReferenceImagesFromLookup(result) {
         sourceField: image.source_field,
         referenceIndex,
         selectedByDesignRequirement: requestedIndexSet.has(referenceIndex),
+        designRequirementDirective,
+        designRequirementRoles: designRequirementRoleList,
       };
     })
     .filter(Boolean);
@@ -659,6 +722,7 @@ function recordProjectDataLayerForRun({
     project,
     designReferenceImages,
     projectDataLayer: dataLayer,
+    flowVersion: FINAL_DISPLAY_FLOW_VERSION,
   });
 }
 
@@ -782,7 +846,20 @@ function imageInputsFromProjectImages(images, role, detail) {
     label: image.title || `Project image ${index + 1}`,
     filename: image.filename || `${image.id}.png`,
     url: image.imageUrl,
-    detail,
+    detail: [
+      detail,
+      image.designRequirementDirective
+        ? `Development requirement for reference image ${image.referenceIndex || index + 1}: ${image.designRequirementDirective}.`
+        : '',
+      Array.isArray(image.designRequirementRoles) && image.designRequirementRoles.length > 0
+        ? `This image must serve only these roles during material extraction: ${image.designRequirementRoles.join(', ')}. Do not mix its role with another reference image.`
+        : '',
+    ].filter(Boolean).join(' '),
+    designRequirementDirective: cleanString(image.designRequirementDirective),
+    designRequirementRoles: Array.isArray(image.designRequirementRoles)
+      ? image.designRequirementRoles
+      : [],
+    referenceIndex: Number(image.referenceIndex) || index + 1,
   }));
 }
 
@@ -868,8 +945,14 @@ function buildMaterialBoardRegenerationPrompt(reverseDescription, sourceLabel, s
   ].join('\n');
 }
 
-function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shapeAnalysis }) {
+function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shapeAnalysis, inputImages = [] }) {
   const isSplit = Boolean(shapeLevel);
+  const imageRoleBindings = inputImages
+    .map((image, index) => cleanString(image.designRequirementDirective)
+      ? `Input image ${index + 1}, company reference image ${image.referenceIndex || index + 1} (${image.filename || image.label || image.id}): ${image.designRequirementDirective}. Required role: ${(image.designRequirementRoles || []).join(', ') || 'explicit development requirement reference'}.`
+      : '')
+    .filter(Boolean)
+    .join('\n');
   return [
     `Process ${sourceLabel} into clean reusable material assets for the MYML default automatic flow.`,
     'This is an extraction/cleanup task, not final product design and not theme re-creation.',
@@ -880,6 +963,9 @@ function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shape
     project.graphicElements ? `Graphic elements: ${project.graphicElements}` : '',
     project.textElements ? `Text elements: ${project.textElements}` : '',
     project.designRequirement ? `Design requirement directives used only for selection, not for inventing new assets: ${project.designRequirement}` : '',
+    imageRoleBindings
+      ? `Source-image responsibility bindings. Execute only bindings explicitly present; when no image-specific binding exists, let the AI judge from the visible image content:\n${imageRoleBindings}`
+      : '',
     shapeAnalysis?.split_reason ? `Shape analysis: ${shapeAnalysis.split_reason}` : '',
     !shapeLevel && shapeAnalysis?.single_material_guidance
       ? `Unified material guidance: ${shapeAnalysis.single_material_guidance}`
@@ -1045,6 +1131,13 @@ function sortElementImagesForFinalInput(images = []) {
   });
 }
 
+function elementImagesForCategory(images = [], category = '') {
+  const normalizedCategory = cleanString(category).toLocaleLowerCase();
+  return sortElementImagesForFinalInput(images.filter((image) => (
+    cleanString(image?.category).toLocaleLowerCase() === normalizedCategory
+  )));
+}
+
 function hasDisplayRun(run) {
   return run &&
     Array.isArray(run.elementImages) &&
@@ -1067,7 +1160,8 @@ function isProjectFinalDisplayRunId(value) {
 
 function isReusableFinalDisplayRun(run) {
   const runId = cleanString(run?.runId);
-  return isProjectFinalDisplayRunId(runId) &&
+  return cleanString(run?.flowVersion) === FINAL_DISPLAY_FLOW_VERSION &&
+    isProjectFinalDisplayRunId(runId) &&
     cleanString(run?.status) === 'completed' &&
     hasDisplayRun(generationOutputRun(run));
 }
@@ -1174,7 +1268,9 @@ function referenceMediaWarnings(failureCount) {
 
 function isPartialFinalDisplayRun(run) {
   const runId = cleanString(run?.runId);
-  return isProjectFinalDisplayRunId(runId) && hasAnyDisplayImage(generationOutputRun(run));
+  return cleanString(run?.flowVersion) === FINAL_DISPLAY_FLOW_VERSION &&
+    isProjectFinalDisplayRunId(runId) &&
+    hasAnyDisplayImage(generationOutputRun(run));
 }
 
 function getProjectRunsForCodeFromDependencies(dependencies, projectCode) {
@@ -1482,7 +1578,10 @@ async function generateMaterialOutputs({
   let currentRun = latestProjectRunForCode(dependencies, normalizedCode);
   if (splitRequired) {
     const generatedRuns = await mapWithConcurrency(levels, stageConcurrency, async (shapeLevel) => {
-      const generationLabel = `${sourceLabel} ${shapeLevel.label}`;
+      const generationLabel = categoryScopedGenerationLabel(
+        project.category,
+        `${sourceLabel} ${shapeLevel.label}`,
+      );
       const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
       if (hasRecordedImageForRequest(rawRun, 'elementImages', splitSource, generationLabel)) {
         return rawRun;
@@ -1499,6 +1598,7 @@ async function generateMaterialOutputs({
             project,
             shapeLevel,
             shapeAnalysis,
+            inputImages,
           }),
           project_code: normalizedCode,
           project_run_id: runId,
@@ -1518,7 +1618,10 @@ async function generateMaterialOutputs({
 
   for (const shapeLevel of levels) {
     const generationSource = shapeLevel ? splitSource : unifiedSource;
-    const generationLabel = shapeLevel ? `${sourceLabel} ${shapeLevel.label}` : unifiedLabel;
+    const generationLabel = categoryScopedGenerationLabel(
+      project.category,
+      shapeLevel ? `${sourceLabel} ${shapeLevel.label}` : unifiedLabel,
+    );
     const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
     const isDesignReferenceUnified = !shapeLevel && sourceKind === 'design_reference';
     const hasExistingGeneratedImage = hasRecordedImageForRequest(
@@ -1541,6 +1644,7 @@ async function generateMaterialOutputs({
           project,
           shapeLevel,
           shapeAnalysis,
+          inputImages,
         }),
         project_code: normalizedCode,
         project_run_id: runId,
@@ -1562,7 +1666,10 @@ async function generateMaterialOutputs({
     if (isDesignReferenceUnified) {
       const latestRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
       const regeneratedSource = 'design_reference_unified_regeneration';
-      const regeneratedLabel = 'Regenerated unified design reference material';
+      const regeneratedLabel = categoryScopedGenerationLabel(
+        project.category,
+        'Regenerated unified design reference material',
+      );
       if (hasRecordedImageForRequest(latestRun, 'elementImages', regeneratedSource, regeneratedLabel)) {
         currentRun = latestRun;
         continue;
@@ -1996,62 +2103,6 @@ async function generateProjectFinalDisplayNow({
     FINAL_DISPLAY_STAGE_CONCURRENCY,
   );
 
-  let currentRun = resumableRun;
-  if (selectedMaterialImages.length > 0) {
-    currentRun = await runStep('material', () => generateMaterialOutputs({
-      analyzeShapes,
-      composePrompt,
-      generateImage,
-      recordResult,
-      dependencies,
-      normalizedCode: code,
-      runId,
-      publicBaseUrl,
-      project,
-      sourceImages: selectedMaterialImages,
-      sourceKind: 'material',
-      sourceLabel: 'gallery material',
-      unifiedSource: 'gallery_material_unified_cleanup',
-      splitSource: 'gallery_material_split_cleanup',
-      unifiedLabel: 'Unified gallery material',
-      stageConcurrency,
-    })) || currentRun;
-  }
-
-  if (generationDesignReferenceImages.length > 0) {
-    currentRun = await runStep('reference', () => generateMaterialOutputs({
-      analyzeShapes,
-      composePrompt,
-      generateImage,
-      recordResult,
-      dependencies,
-      normalizedCode: code,
-      runId,
-      publicBaseUrl,
-      project,
-      sourceImages: generationDesignReferenceImages,
-      sourceKind: 'design_reference',
-      sourceLabel: designReferenceSourceLabel(generationDesignReferenceImages),
-      unifiedSource: 'company_design_reference_unified_split',
-      splitSource: 'company_design_reference_split',
-      unifiedLabel: 'Unified design reference material',
-      stageConcurrency,
-    })) || currentRun;
-  }
-
-  currentRun = latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun;
-  const currentOutputRun = generationOutputRun(currentRun);
-  const elementImages = sortElementImagesForFinalInput(
-    Array.isArray(currentOutputRun?.elementImages) ? currentOutputRun.elementImages : [],
-  );
-  if (elementImages.length === 0) {
-    const error = new Error('Material image block was not recorded.');
-    error.statusCode = 502;
-    error.code = 'EVIDENCE_AGENT_MATERIAL_RESULT_MISSING';
-    error.retryable = true;
-    throw error;
-  }
-
   const categoryTargets = categoryTargetsFromLookup(lookup);
   const finalTargets = (categoryTargets.length > 0
     ? categoryTargets
@@ -2065,9 +2116,84 @@ async function generateProjectFinalDisplayNow({
     ...target,
     historyImage: historyImageFromCategoryTarget(lookup, target),
   }));
-  const missingHistoryTargets = finalTargets.filter((target) => !target.historyImage);
-  const readyFinalTargets = finalTargets.filter((target) => target.historyImage);
-  if (readyFinalTargets.length === 0) {
+
+  let currentRun = resumableRun;
+  const categoryMaterialGroups = [];
+  for (const target of finalTargets) {
+    const targetProject = {
+      ...project,
+      category: target.category || project.category,
+    };
+
+    if (selectedMaterialImages.length > 0) {
+      currentRun = await runStep('material', () => generateMaterialOutputs({
+        analyzeShapes,
+        composePrompt,
+        generateImage,
+        recordResult,
+        dependencies,
+        normalizedCode: code,
+        runId,
+        publicBaseUrl,
+        project: targetProject,
+        sourceImages: selectedMaterialImages,
+        sourceKind: 'material',
+        sourceLabel: 'gallery material',
+        unifiedSource: 'gallery_material_unified_cleanup',
+        splitSource: 'gallery_material_split_cleanup',
+        unifiedLabel: 'Unified gallery material',
+        stageConcurrency,
+      })) || currentRun;
+    }
+
+    if (generationDesignReferenceImages.length > 0) {
+      currentRun = await runStep('reference', () => generateMaterialOutputs({
+        analyzeShapes,
+        composePrompt,
+        generateImage,
+        recordResult,
+        dependencies,
+        normalizedCode: code,
+        runId,
+        publicBaseUrl,
+        project: targetProject,
+        sourceImages: generationDesignReferenceImages,
+        sourceKind: 'design_reference',
+        sourceLabel: designReferenceSourceLabel(generationDesignReferenceImages),
+        unifiedSource: 'company_design_reference_unified_split',
+        splitSource: 'company_design_reference_split',
+        unifiedLabel: 'Unified design reference material',
+        stageConcurrency,
+      })) || currentRun;
+    }
+
+    currentRun = latestOutputRunForCode(dependencies, code) ||
+      latestProjectRunForCode(dependencies, code) ||
+      currentRun;
+    const currentOutputRun = generationOutputRun(currentRun);
+    const elementImages = elementImagesForCategory(
+      Array.isArray(currentOutputRun?.elementImages) ? currentOutputRun.elementImages : [],
+      targetProject.category,
+    );
+    if (elementImages.length === 0) {
+      const error = new Error(`Material image block was not recorded for category: ${targetProject.category}.`);
+      error.statusCode = 502;
+      error.code = 'EVIDENCE_AGENT_MATERIAL_RESULT_MISSING';
+      error.retryable = true;
+      throw error;
+    }
+    categoryMaterialGroups.push({
+      target,
+      targetProject,
+      elementImages,
+    });
+  }
+
+  const missingHistoryTargets = categoryMaterialGroups
+    .filter((group) => !group.target.historyImage)
+    .map((group) => group.target);
+  const readyFinalGroups = categoryMaterialGroups.filter((group) => group.target.historyImage);
+  if (readyFinalGroups.length === 0) {
     if (options.synchronous === true) {
       await reportProgress({
         stage: 'project_final_display',
@@ -2102,21 +2228,22 @@ async function generateProjectFinalDisplayNow({
     : [];
 
   const composedTargets = await runStep('prompt', async () => {
-    return mapWithConcurrency(readyFinalTargets, stageConcurrency, async (target) => {
-      const targetProject = {
-        ...project,
-        category: target.category || project.category,
-      };
+    return mapWithConcurrency(readyFinalGroups, stageConcurrency, async (group) => {
       const finalInputImages = [
-        target.historyImage,
-        ...imageInputsFromRunImages(elementImages, publicBaseUrl),
+        group.target.historyImage,
+        ...imageInputsFromRunImages(group.elementImages, publicBaseUrl),
       ];
-      const templatePrompt = buildFinalTemplatePrompt(targetProject, elementImages, true, finalInputImages);
+      const templatePrompt = buildFinalTemplatePrompt(
+        group.targetProject,
+        group.elementImages,
+        true,
+        finalInputImages,
+      );
       const response = await composePrompt({
         template_prompt: templatePrompt,
         prompt_template_id: FINAL_DISPLAY_PROMPT_TEMPLATE_ID,
         project_code: code,
-        category: targetProject.category,
+        category: group.targetProject.category,
         input_images: finalInputImages,
       });
       if (response.status !== 'success' || !response.final_prompt) {
@@ -2127,7 +2254,9 @@ async function generateProjectFinalDisplayNow({
         throw error;
       }
       return {
-        target,
+        target: group.target,
+        targetProject: group.targetProject,
+        elementImages: group.elementImages,
         inputImages: finalInputImages,
         composed: response,
       };
@@ -2397,5 +2526,6 @@ module.exports = {
   buildFallbackFinalPrompt,
   buildFinalTemplatePrompt,
   buildMaterialProcessingPrompt,
+  collectDesignRequirementImageDirectives,
   prepareProjectFinalDisplay,
 };

@@ -10,7 +10,11 @@ const {
   recordProjectRunProgress,
 } = require('../services/projectRunStore');
 const { referenceSourceHash } = require('../services/projectReferenceMediaStore');
-const { prepareProjectFinalDisplay } = require('../services/projectFinalDisplayService');
+const {
+  buildMaterialProcessingPrompt,
+  collectDesignRequirementImageDirectives,
+  prepareProjectFinalDisplay,
+} = require('../services/projectFinalDisplayService');
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'myml-final-display-'));
 const storeOptions = {
@@ -56,6 +60,49 @@ function recordGeneratedImage(request, label) {
 }
 
 async function main() {
+  const imageDirectives = collectDesignRequirementImageDirectives({
+    design_requirement: '钥匙扣形状见图1，黑色底，一面图案放一棵树，见图2，下方文案PASTOR，另一面文案见文字元素，排版见参考图3。',
+  });
+  assert.match(imageDirectives.get(1).directives.join('；'), /钥匙扣形状见图1/);
+  assert(imageDirectives.get(1).roles.includes('shape/outline reference'));
+  assert.match(imageDirectives.get(2).directives.join('；'), /一面图案放一棵树，见图2/);
+  assert(imageDirectives.get(2).roles.includes('motif material reference'));
+  assert.match(imageDirectives.get(3).directives.join('；'), /排版见参考图3/);
+  assert(imageDirectives.get(3).roles.includes('layout/placement reference'));
+  assert.strictEqual(
+    collectDesignRequirementImageDirectives({ design_requirement: '可爱风格，紫色底，文案Happy Halloween' }).size,
+    0,
+  );
+  const boundMaterialPrompt = buildMaterialProcessingPrompt({
+    sourceLabel: 'company design reference material',
+    project: {
+      category: '钥匙扣',
+      graphicElements: '树',
+      textElements: 'PASTOR',
+      designRequirement: '图案见图2，排版见图3',
+    },
+    shapeLevel: null,
+    shapeAnalysis: { split_required: false, single_material_guidance: 'Keep one board.' },
+    inputImages: [{
+      id: 'reference-2',
+      filename: 'reference-2.png',
+      detail: 'Development requirement for reference image 2: 图案见图2.',
+      designRequirementDirective: '图案见图2',
+      designRequirementRoles: ['motif material reference'],
+      referenceIndex: 2,
+    }],
+  });
+  assert.match(boundMaterialPrompt, /Source-image responsibility bindings/);
+  assert.match(boundMaterialPrompt, /company reference image 2 .*: 图案见图2/);
+  const unboundMaterialPrompt = buildMaterialProcessingPrompt({
+    sourceLabel: 'company design reference material',
+    project: { category: '餐盘', graphicElements: '花朵', textElements: '', designRequirement: '可爱风格，紫色底' },
+    shapeLevel: null,
+    shapeAnalysis: { split_required: false },
+    inputImages: [{ id: 'reference-1', filename: 'reference-1.png', detail: 'Generic design reference.' }],
+  });
+  assert.doesNotMatch(unboundMaterialPrompt, /Source-image responsibility bindings/);
+
   const productRunId = 'prun-YXF2511160004-product';
   recordGeneratedImage({
     project_code: 'YXF2511160004',
@@ -80,6 +127,12 @@ async function main() {
     generation_source: 'automated_flow_final_generation',
     generation_label: 'Final generated design',
   }, 'final design');
+  recordProjectRunMetadata({
+    project_code: 'YXF2511160004',
+    project_run_id: productRunId,
+  }, {
+    flowVersion: 'category_full_v1',
+  }, storeOptions);
 
   const result = await prepareProjectFinalDisplay({
     projectCode: 'YXF2511160004',
@@ -131,6 +184,7 @@ async function main() {
     project_code: 'YXF2511160013',
     project_run_id: legacyRunId,
   }, {
+    flowVersion: 'category_full_v1',
     project: { projectCode: 'YXF2511160013' },
     designReferenceImages: [{
       id: 'legacy-reference',
@@ -662,6 +716,7 @@ async function main() {
 
   const comboGenerateCalls = [];
   const comboComposeCalls = [];
+  const comboAnalyzeCalls = [];
   const combo = await prepareProjectFinalDisplay({
     projectCode: 'YXF2511160008',
     request: {},
@@ -744,15 +799,18 @@ async function main() {
           },
         },
       }),
-      analyzeMaterialShapeLevels: async () => ({
-        status: 'success',
-        split_required: true,
-        levels: {
-          primary: { prompt_guidance: 'primary' },
-          secondary: { prompt_guidance: 'secondary' },
-          tertiary: { prompt_guidance: 'tertiary' },
-        },
-      }),
+      analyzeMaterialShapeLevels: async (request) => {
+        comboAnalyzeCalls.push(request);
+        return {
+          status: 'success',
+          split_required: true,
+          levels: {
+            primary: { prompt_guidance: 'primary' },
+            secondary: { prompt_guidance: 'secondary' },
+            tertiary: { prompt_guidance: 'tertiary' },
+          },
+        };
+      },
       composeFinalPrompt: async (request) => {
         comboComposeCalls.push(request);
         return {
@@ -789,7 +847,8 @@ async function main() {
   });
 
   assert.strictEqual(combo.status, 'completed');
-  assert.strictEqual(combo.run.elementImages.length, 3);
+  assert.strictEqual(combo.run.flowVersion, 'category_full_v1');
+  assert.strictEqual(combo.run.elementImages.length, 6);
   assert.strictEqual(combo.run.finalDesignImages.length, 2);
   assert.strictEqual(combo.display.projectDataLayer.sections.categoryTargets.count, 2);
   assert.deepStrictEqual(
@@ -798,17 +857,29 @@ async function main() {
       'company_design_reference_split',
       'company_design_reference_split',
       'company_design_reference_split',
+      'company_design_reference_split',
+      'company_design_reference_split',
+      'company_design_reference_split',
       'automated_flow_final_generation',
       'automated_flow_final_generation',
     ],
   );
   assert.deepStrictEqual(comboComposeCalls.map((call) => call.category), ['餐盘', '纸巾']);
+  assert.deepStrictEqual(comboAnalyzeCalls.map((call) => call.category), ['餐盘', '纸巾']);
   assert.deepStrictEqual(
     comboGenerateCalls.filter((call) => call.stage === 'final_design').map((call) => call.category),
     ['餐盘', '纸巾'],
   );
-  assert.match(comboGenerateCalls[3].inputImages[0].url, /plate-history\.png$/);
-  assert.match(comboGenerateCalls[4].inputImages[0].url, /napkin-history\.png$/);
+  assert.deepStrictEqual(
+    comboGenerateCalls.filter((call) => call.stage === 'element_image').map((call) => call.category),
+    ['餐盘', '餐盘', '餐盘', '纸巾', '纸巾', '纸巾'],
+  );
+  assert.strictEqual(comboGenerateCalls[6].inputImages.length, 4);
+  assert.strictEqual(comboGenerateCalls[7].inputImages.length, 4);
+  assert(comboGenerateCalls[6].inputImages.slice(1).every((image) => image.label.includes('餐盘')));
+  assert(comboGenerateCalls[7].inputImages.slice(1).every((image) => image.label.includes('纸巾')));
+  assert.match(comboGenerateCalls[6].inputImages[0].url, /plate-history\.png$/);
+  assert.match(comboGenerateCalls[7].inputImages[0].url, /napkin-history\.png$/);
 
   const partialGenerateCalls = [];
   const partialCategoryDependencies = {
@@ -878,7 +949,7 @@ async function main() {
   });
 
   assert.strictEqual(partialCategoryResult.status, 'partial');
-  assert.strictEqual(partialCategoryResult.run.elementImages.length, 3);
+  assert.strictEqual(partialCategoryResult.run.elementImages.length, 6);
   assert.strictEqual(partialCategoryResult.run.finalDesignImages.length, 1);
   assert.deepStrictEqual(
     partialGenerateCalls

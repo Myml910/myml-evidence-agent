@@ -292,7 +292,7 @@ export interface MaterialShapeAnalysisRequest {
   category?: string;
   graphic_elements: string[];
   text_elements: string[];
-  design_requirement_directives: string[];
+  design_requirement_directives?: string[];
   input_images: GeneratePatternImageInputImage[];
 }
 

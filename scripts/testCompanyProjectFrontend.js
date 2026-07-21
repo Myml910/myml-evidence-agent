@@ -111,10 +111,9 @@ function assertSourceIsSlim() {
   assert(componentSource.includes('必须包含的文字元素'));
   assert(componentSource.includes('文字元素要求：当前文字元素板块为空'));
   assert(componentSource.includes('collectGenerationDesignRequirementDirectives'));
-  assert(componentSource.includes('collectDesignRequirementImageDirectives'));
-  assert(componentSource.includes('designRequirementImageBindingSummary'));
-  assert(componentSource.includes('开发思路图片职责绑定（必须逐图执行，不得混用）'));
-  assert(componentSource.includes('不得把该图与其他参考图的职责混用'));
+  assert(componentSource.includes('referenceIndicesFromRequirementText'));
+  assert(componentSource.includes('开发思路只负责选图，不作为素材判断或素材生成提示词'));
+  assert(componentSource.includes('requestedReferenceIndices.length > 0'));
   assert(componentSource.includes('collectDesignRequirementReferenceIndices'));
   assert(componentSource.includes('开发思路设计指令'));
   assert(componentSource.includes('载体品类、尺寸、规格、cm/mm 信息由历史版式和真实品类图锁定'));
@@ -386,10 +385,8 @@ function assertSourceIsSlim() {
   assert(componentSource.includes('AI_IMAGE_GENERATOR_TIMEOUT_MS'));
   assert(componentSource.includes('ai-error-preview'));
   assert(serverSource.includes('generatePatternImage'));
-  assert(materialShapeAnalyzerSource.includes('开发思路 design_requirement_directives 是高优先级判断依据'));
-  assert(materialShapeAnalyzerSource.includes('如果没有出现具体图号或具体用途，不得虚构'));
-  assert(materialShapeAnalyzerSource.includes('形状见图1、图案见图2、排版见参考图3'));
-  assert(materialShapeAnalyzerSource.includes('不能只取其中一张参考图'));
+  assert(materialShapeAnalyzerSource.includes('开发思路只在上游用于选择哪些公司设计参考图进入本步骤'));
+  assert(!materialShapeAnalyzerSource.includes('design_requirement_directives: normalizeStringList'));
   assert(appSource.includes('MYML Evidence Agent'));
   assert(serverSource.includes("express.json({ limit: '60mb' })"));
   assert(serverSource.includes('entity.too.large'));

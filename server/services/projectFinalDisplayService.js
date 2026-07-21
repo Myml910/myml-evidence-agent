@@ -25,7 +25,7 @@ const {
 
 const FINAL_DISPLAY_PROMPT_TEMPLATE_ID = 'structured_ai';
 const FINAL_DISPLAY_FINAL_GENERATION_SOURCE = 'automated_flow_final_generation';
-const FINAL_DISPLAY_FLOW_VERSION = 'category_full_v1';
+const FINAL_DISPLAY_FLOW_VERSION = 'category_full_v3_reference_selection_only';
 const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID = 'material_board_reverse';
 const GENERATION_MATERIAL_MIN_SCORE = 0.8;
 const AGENT_FLOW_MAX_RETRIES = 3;
@@ -64,7 +64,7 @@ const MATERIAL_SHAPE_LEVELS = [
 const ACCEPTED_ELEMENT_SOURCES = new Set([
   'gallery_material_unified_cleanup',
   'gallery_material_split_cleanup',
-  'company_design_reference_split',
+  'design_reference_split_regeneration',
   'design_reference_unified_regeneration',
 ]);
 const ACCEPTED_FINAL_SOURCES = new Set([
@@ -448,56 +448,9 @@ function referenceIndicesFromRequirementText(value) {
   return Array.from(indices).sort((left, right) => left - right);
 }
 
-function designRequirementRoles(value) {
-  const roles = [];
-  if (/(形状|外形|轮廓|刀模|款式)/i.test(value)) roles.push('shape/outline reference');
-  if (/(图案|主体|主图|元素|装饰|角色)/i.test(value)) roles.push('motif material reference');
-  if (/(排版|布局|版式|位置|一面|另一面)/i.test(value)) roles.push('layout/placement reference');
-  if (/(文案|文字|字体|字形|标题)/i.test(value)) roles.push('text/lettering reference');
-  if (/(配色|颜色|色系|底色|背景|黑色|白色|紫色|蓝色|粉色|红色|绿色|黄色|橙色)/i.test(value)) roles.push('color/background reference');
-  if (/(风格|可爱|卡通|童趣|复古|简约|高端|酷|温馨)/i.test(value)) roles.push('style reference');
-  return Array.from(new Set(roles.length > 0 ? roles : ['development requirement reference']));
-}
-
-function collectDesignRequirementImageDirectives(proposal = {}) {
-  const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
-  const directiveMap = new Map();
-  const fragments = designRequirement
-    .replace(/\r?\n/g, '，')
-    .split(/[，,；;。.!！?？]+/)
-    .map((fragment) => fragment.trim())
-    .filter(Boolean);
-
-  fragments.forEach((fragment, index) => {
-    const referenceIndices = referenceIndicesFromRequirementText(fragment);
-    if (referenceIndices.length === 0) return;
-    const previousFragment = fragments[index - 1] || '';
-    const referenceOnly = /^(?:见|看|参考|按|按照|跟|根据)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*[0-9一二两三四五六七八九十、,，和及\s]+$/i.test(fragment);
-    const directive = (
-      referenceOnly && previousFragment && referenceIndicesFromRequirementText(previousFragment).length === 0
-        ? `${previousFragment}，${fragment}`
-        : fragment
-    ).slice(0, 240);
-    const roles = designRequirementRoles(directive);
-    referenceIndices.forEach((referenceIndex) => {
-      const current = directiveMap.get(referenceIndex) || { directives: [], roles: [] };
-      directiveMap.set(referenceIndex, {
-        directives: Array.from(new Set([...current.directives, directive])),
-        roles: Array.from(new Set([...current.roles, ...roles])),
-      });
-    });
-  });
-
-  return directiveMap;
-}
-
 function collectDesignRequirementReferenceIndices(proposal = {}) {
   const designRequirement = String(proposal.design_requirement || proposal.development_requirement || '');
-  const directiveIndices = Array.from(collectDesignRequirementImageDirectives(proposal).keys());
-  return Array.from(new Set([
-    ...directiveIndices,
-    ...referenceIndicesFromRequirementText(designRequirement),
-  ])).sort((left, right) => left - right);
+  return referenceIndicesFromRequirementText(designRequirement);
 }
 
 function projectPreviewFromLookup(result) {
@@ -557,7 +510,6 @@ function designReferenceImagesFromLookup(result) {
   const sourceLabel = designImages.length > 0 ? 'Company design reference' : 'External evidence reference';
   const requestedIndices = collectDesignRequirementReferenceIndices(proposal);
   const requestedIndexSet = new Set(requestedIndices);
-  const imageDirectiveMap = collectDesignRequirementImageDirectives(proposal);
   const indexedImages = sourceImages
     .filter((image) => safeImageUrl(image.url))
     .map((image, index) => ({
@@ -567,7 +519,7 @@ function designReferenceImagesFromLookup(result) {
   const selectedImages = requestedIndices.length > 0
     ? indexedImages.filter((item) => requestedIndexSet.has(item.referenceIndex))
     : indexedImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
-  const finalImages = selectedImages.length > 0
+  const finalImages = requestedIndices.length > 0
     ? selectedImages
     : indexedImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
 
@@ -576,9 +528,6 @@ function designReferenceImagesFromLookup(result) {
     .map(({ image, referenceIndex }) => {
       const imageUrl = safeImageUrl(image.url);
       if (!imageUrl) return null;
-      const imageDirective = imageDirectiveMap.get(referenceIndex);
-      const designRequirementDirective = imageDirective?.directives.join('; ') || '';
-      const designRequirementRoleList = imageDirective?.roles || [];
       return {
         id: `company_design_reference_${projectCode}_${referenceIndex}`,
         projectCode,
@@ -591,8 +540,6 @@ function designReferenceImagesFromLookup(result) {
         sourceField: image.source_field,
         referenceIndex,
         selectedByDesignRequirement: requestedIndexSet.has(referenceIndex),
-        designRequirementDirective,
-        designRequirementRoles: designRequirementRoleList,
       };
     })
     .filter(Boolean);
@@ -846,19 +793,7 @@ function imageInputsFromProjectImages(images, role, detail) {
     label: image.title || `Project image ${index + 1}`,
     filename: image.filename || `${image.id}.png`,
     url: image.imageUrl,
-    detail: [
-      detail,
-      image.designRequirementDirective
-        ? `Development requirement for reference image ${image.referenceIndex || index + 1}: ${image.designRequirementDirective}.`
-        : '',
-      Array.isArray(image.designRequirementRoles) && image.designRequirementRoles.length > 0
-        ? `This image must serve only these roles during material extraction: ${image.designRequirementRoles.join(', ')}. Do not mix its role with another reference image.`
-        : '',
-    ].filter(Boolean).join(' '),
-    designRequirementDirective: cleanString(image.designRequirementDirective),
-    designRequirementRoles: Array.isArray(image.designRequirementRoles)
-      ? image.designRequirementRoles
-      : [],
+    detail,
     referenceIndex: Number(image.referenceIndex) || index + 1,
   }));
 }
@@ -918,9 +853,9 @@ const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE = [
   '[Describe text content and font style if applicable. If none, write "None".]',
 ].join('\n');
 
-function buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis) {
+function buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis, materialKind = 'material image') {
   return [
-    'Analyze the provided unified material board and describe only the visual content that already exists in the image.',
+    `Analyze the provided ${materialKind} and describe only the visual content that already exists in the image.`,
     `Material source: ${sourceLabel}. Source images: ${sourceNames || '-'}.`,
     shapeAnalysis ? `Previous AI shape decision: ${materialShapeAnalysisSummary(shapeAnalysis)}.` : '',
     'Return only the requested Markdown visual description. Do not explain the workflow and do not add extra sections.',
@@ -929,30 +864,29 @@ function buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis
   ].filter(Boolean).join('\n');
 }
 
-function buildMaterialBoardRegenerationPrompt(reverseDescription, sourceLabel, sourceNames) {
+function buildMaterialBoardRegenerationPrompt(
+  reverseDescription,
+  sourceLabel,
+  sourceNames,
+  materialKind = 'material image',
+) {
   return [
-    'Generate a new clean unified material board using text-to-image only, based strictly on the reverse-engineered visual description below.',
+    `Generate a new clean ${materialKind} using text-to-image only, based strictly on the reverse-engineered visual description below.`,
     '',
     `Material source: ${sourceLabel}. Original source images: ${sourceNames || '-'}.`,
-    'This is a material-board regeneration step, not a final product design and not a new theme creation task.',
+    `This is a ${materialKind} regeneration step, not a final product design and not a new theme creation task.`,
     'Preserve the motif shapes, lettering shapes, linework, texture, local decorations, border language, and color relationships described below.',
     'Do not add new subjects, new readable text, new icons, new characters, or new decorations that are not described.',
     'Do not recreate the original product carrier, product mockup, screenshot interface, price/platform/store information, measurements, shadows, or scene background.',
-    'Output a clean unified material board on a plain background with clear spacing between independent reusable assets. It must be suitable to combine with primary/secondary/tertiary material assets in the final image input.',
+    `Output a clean ${materialKind} on a plain background with clear spacing between independent reusable assets. It must be suitable for the final image input.`,
     '',
     'Reverse-engineered visual description:',
     reverseDescription,
   ].join('\n');
 }
 
-function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shapeAnalysis, inputImages = [] }) {
+function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shapeAnalysis }) {
   const isSplit = Boolean(shapeLevel);
-  const imageRoleBindings = inputImages
-    .map((image, index) => cleanString(image.designRequirementDirective)
-      ? `Input image ${index + 1}, company reference image ${image.referenceIndex || index + 1} (${image.filename || image.label || image.id}): ${image.designRequirementDirective}. Required role: ${(image.designRequirementRoles || []).join(', ') || 'explicit development requirement reference'}.`
-      : '')
-    .filter(Boolean)
-    .join('\n');
   return [
     `Process ${sourceLabel} into clean reusable material assets for the MYML default automatic flow.`,
     'This is an extraction/cleanup task, not final product design and not theme re-creation.',
@@ -962,10 +896,6 @@ function buildMaterialProcessingPrompt({ sourceLabel, project, shapeLevel, shape
       : 'AI has judged that forced primary/secondary/tertiary splitting is not needed. Create one unified cleaned material board.',
     project.graphicElements ? `Graphic elements: ${project.graphicElements}` : '',
     project.textElements ? `Text elements: ${project.textElements}` : '',
-    project.designRequirement ? `Design requirement directives used only for selection, not for inventing new assets: ${project.designRequirement}` : '',
-    imageRoleBindings
-      ? `Source-image responsibility bindings. Execute only bindings explicitly present; when no image-specific binding exists, let the AI judge from the visible image content:\n${imageRoleBindings}`
-      : '',
     shapeAnalysis?.split_reason ? `Shape analysis: ${shapeAnalysis.split_reason}` : '',
     !shapeLevel && shapeAnalysis?.single_material_guidance
       ? `Unified material guidance: ${shapeAnalysis.single_material_guidance}`
@@ -1110,7 +1040,7 @@ function materialShapeLevelIndexFromRecord(image) {
 
 function finalMaterialSourceIndexFromRecord(image) {
   const source = cleanString(image?.source);
-  if (source === 'company_design_reference_split' || source === 'design_reference_unified_regeneration') {
+  if (source === 'design_reference_split_regeneration' || source === 'design_reference_unified_regeneration') {
     return 0;
   }
   if (source === 'gallery_material_unified_cleanup' || source === 'gallery_material_split_cleanup') {
@@ -1499,7 +1429,6 @@ async function analyzeMaterialSource({
     source_kind: sourceKind,
     graphic_elements: listFromText(project.graphicElements),
     text_elements: listFromText(project.textElements),
-    design_requirement_directives: listFromText(project.designRequirement, 8),
     input_images: inputImages,
   });
 
@@ -1576,67 +1505,40 @@ async function generateMaterialOutputs({
   const levels = splitRequired ? MATERIAL_SHAPE_LEVELS : [null];
 
   let currentRun = latestProjectRunForCode(dependencies, normalizedCode);
-  if (splitRequired) {
-    const generatedRuns = await mapWithConcurrency(levels, stageConcurrency, async (shapeLevel) => {
-      const generationLabel = categoryScopedGenerationLabel(
-        project.category,
-        `${sourceLabel} ${shapeLevel.label}`,
-      );
-      const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
-      if (hasRecordedImageForRequest(rawRun, 'elementImages', splitSource, generationLabel)) {
-        return rawRun;
-      }
-
-      return generateAndRecordImage({
-        generateImage,
-        recordResult,
-        dependencies,
-        normalizedCode,
-        request: {
-          prompt: buildMaterialProcessingPrompt({
-            sourceLabel,
-            project,
-            shapeLevel,
-            shapeAnalysis,
-            inputImages,
-          }),
-          project_code: normalizedCode,
-          project_run_id: runId,
-          generation_stage: 'element_image',
-          generation_source: splitSource,
-          generation_label: generationLabel,
-          category: project.category,
-          input_images: inputImages,
-        },
-      });
-    });
-
-    return latestProjectRunForCode(dependencies, normalizedCode) ||
-      generatedRuns.filter(Boolean).at(-1) ||
-      currentRun;
-  }
-
-  for (const shapeLevel of levels) {
+  const generateLevel = async (shapeLevel) => {
     const generationSource = shapeLevel ? splitSource : unifiedSource;
     const generationLabel = categoryScopedGenerationLabel(
       project.category,
       shapeLevel ? `${sourceLabel} ${shapeLevel.label}` : unifiedLabel,
     );
     const rawRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
-    const isDesignReferenceUnified = !shapeLevel && sourceKind === 'design_reference';
+    const isDesignReferenceMaterial = sourceKind === 'design_reference';
+    const regeneratedSource = shapeLevel
+      ? 'design_reference_split_regeneration'
+      : 'design_reference_unified_regeneration';
+    const regeneratedLabel = categoryScopedGenerationLabel(
+      project.category,
+      shapeLevel
+        ? `Regenerated ${sourceLabel} ${shapeLevel.label}`
+        : 'Regenerated unified design reference material',
+    );
+    const hasExistingRegeneratedImage = isDesignReferenceMaterial && hasRecordedImageForRequest(
+      rawRun,
+      'elementImages',
+      regeneratedSource,
+      regeneratedLabel,
+    );
     const hasExistingGeneratedImage = hasRecordedImageForRequest(
       rawRun,
       'elementImages',
       generationSource,
       generationLabel,
     );
-    if (hasExistingGeneratedImage && !isDesignReferenceUnified) {
-      currentRun = rawRun || currentRun;
-      continue;
+    if (hasExistingRegeneratedImage) {
+      return rawRun;
     }
-
     if (hasExistingGeneratedImage) {
-      currentRun = rawRun || currentRun;
+      if (!isDesignReferenceMaterial) return rawRun;
     } else {
       const request = {
         prompt: buildMaterialProcessingPrompt({
@@ -1644,7 +1546,6 @@ async function generateMaterialOutputs({
           project,
           shapeLevel,
           shapeAnalysis,
-          inputImages,
         }),
         project_code: normalizedCode,
         project_run_id: runId,
@@ -1654,53 +1555,53 @@ async function generateMaterialOutputs({
         category: project.category,
         input_images: inputImages,
       };
-      currentRun = await generateAndRecordImage({
+      await generateAndRecordImage({
         generateImage,
         recordResult,
         dependencies,
         normalizedCode,
         request,
-      }) || currentRun;
+      });
     }
 
-    if (isDesignReferenceUnified) {
+    if (isDesignReferenceMaterial) {
       const latestRun = latestProjectRunForCode(dependencies, normalizedCode) || currentRun;
-      const regeneratedSource = 'design_reference_unified_regeneration';
-      const regeneratedLabel = categoryScopedGenerationLabel(
-        project.category,
-        'Regenerated unified design reference material',
-      );
       if (hasRecordedImageForRequest(latestRun, 'elementImages', regeneratedSource, regeneratedLabel)) {
-        currentRun = latestRun;
-        continue;
+        return latestRun;
       }
 
-      const unifiedRecord = recordedImageForRequest(
+      const extractedRecord = recordedImageForRequest(
         latestRun,
         'elementImages',
         generationSource,
         generationLabel,
       );
-      const unifiedInputImage = recordedImageToInputImage(
-        unifiedRecord,
+      const extractedInputImage = recordedImageToInputImage(
+        extractedRecord,
         publicBaseUrl,
         generationLabel,
       );
-      if (!unifiedInputImage) {
-        continue;
-      }
+      if (!extractedInputImage) return latestRun;
 
       const sourceNames = sourceImages.map((image) => image.filename).filter(Boolean).join(', ');
+      const materialKind = shapeLevel
+        ? `${shapeLevel.label} material image`
+        : 'unified material board';
       const reverseResponse = await composePrompt({
-        template_prompt: buildMaterialBoardReversePrompt(sourceLabel, sourceNames, shapeAnalysis),
+        template_prompt: buildMaterialBoardReversePrompt(
+          sourceLabel,
+          sourceNames,
+          shapeAnalysis,
+          materialKind,
+        ),
         prompt_template_id: MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID,
         project_code: normalizedCode,
         category: project.category,
         input_images: [
           {
-            ...unifiedInputImage,
+            ...extractedInputImage,
             role: 'material_board_reverse_source',
-            detail: 'Intermediate unified material board generated from company design reference images. It is used only for reverse prompt analysis.',
+            detail: `Intermediate ${materialKind} generated from company design reference images. It is used only for reverse prompt analysis and never enters final generation directly.`,
           },
         ],
       });
@@ -1713,7 +1614,7 @@ async function generateMaterialOutputs({
         throw error;
       }
 
-      currentRun = await generateAndRecordImage({
+      return generateAndRecordImage({
         generateImage,
         recordResult,
         dependencies,
@@ -1723,6 +1624,7 @@ async function generateMaterialOutputs({
             reverseResponse.final_prompt,
             sourceLabel,
             sourceNames,
+            materialKind,
           ),
           project_code: normalizedCode,
           project_run_id: runId,
@@ -1733,8 +1635,21 @@ async function generateMaterialOutputs({
           category: project.category,
           input_images: [],
         },
-      }) || currentRun;
+      });
     }
+
+    return latestProjectRunForCode(dependencies, normalizedCode) || rawRun;
+  };
+
+  if (splitRequired) {
+    const generatedRuns = await mapWithConcurrency(levels, stageConcurrency, generateLevel);
+    return latestProjectRunForCode(dependencies, normalizedCode) ||
+      generatedRuns.filter(Boolean).at(-1) ||
+      currentRun;
+  }
+
+  for (const shapeLevel of levels) {
+    currentRun = await generateLevel(shapeLevel) || currentRun;
   }
 
   return currentRun;
@@ -2526,6 +2441,6 @@ module.exports = {
   buildFallbackFinalPrompt,
   buildFinalTemplatePrompt,
   buildMaterialProcessingPrompt,
-  collectDesignRequirementImageDirectives,
+  designReferenceImagesFromLookup,
   prepareProjectFinalDisplay,
 };

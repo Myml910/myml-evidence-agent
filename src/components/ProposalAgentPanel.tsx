@@ -609,8 +609,6 @@ type ImageToImageInputImage = {
   matchedElements?: string[];
   selectedByDesignRequirement?: boolean;
   designReferenceIndex?: number;
-  designRequirementDirective?: string;
-  designRequirementRoles?: string[];
   sourceField?: string;
   materialShapeLevel?: MaterialShapeLevel['key'];
   category?: string;
@@ -786,84 +784,8 @@ function referenceIndicesFromRequirementText(value: string) {
   return Array.from(indices).sort((left, right) => left - right);
 }
 
-function designRequirementRoles(value: string) {
-  const roles: string[] = [];
-  if (/(形状|外形|轮廓|刀模|款式)/i.test(value)) roles.push('形状/轮廓依据');
-  if (/(图案|主体|主图|元素|装饰|角色)/i.test(value)) roles.push('图案素材依据');
-  if (/(排版|布局|版式|位置|一面|另一面)/i.test(value)) roles.push('排版/位置依据');
-  if (/(文案|文字|字体|字形|标题)/i.test(value)) roles.push('文字依据');
-  if (/(配色|颜色|色系|底色|背景|黑色|白色|紫色|蓝色|粉色|红色|绿色|黄色|橙色)/i.test(value)) roles.push('配色/背景依据');
-  if (/(风格|可爱|卡通|童趣|复古|简约|高端|酷|温馨)/i.test(value)) roles.push('风格依据');
-  return uniqueDisplayTerms(roles.length > 0 ? roles : ['开发思路指定参考依据']);
-}
-
-function collectDesignRequirementImageDirectives(proposal: CompanyProjectProposal) {
-  const designRequirement = String(proposal.design_requirement || '');
-  const directiveMap = new Map<number, { directives: string[]; roles: string[] }>();
-  const fragments = designRequirement
-    .replace(/\r?\n/g, '，')
-    .split(/[，,；;。.!！?？]+/)
-    .map((fragment) => fragment.trim())
-    .filter(Boolean);
-
-  fragments.forEach((fragment, index) => {
-    const referenceIndices = referenceIndicesFromRequirementText(fragment);
-    if (referenceIndices.length === 0) return;
-    const previousFragment = fragments[index - 1] || '';
-    const referenceOnly = /^(?:见|看|参考|按|按照|跟|根据)?\s*(?:公司)?(?:设计)?(?:参考)?\s*(?:图|图片)\s*[:：#-]?\s*[0-9一二两三四五六七八九十、,，和及\s]+$/i.test(fragment);
-    const directive = shortLabel(
-      referenceOnly && previousFragment && referenceIndicesFromRequirementText(previousFragment).length === 0
-        ? `${previousFragment}，${fragment}`
-        : fragment,
-      240,
-    );
-    const roles = designRequirementRoles(directive);
-    referenceIndices.forEach((referenceIndex) => {
-      const current = directiveMap.get(referenceIndex) || { directives: [], roles: [] };
-      directiveMap.set(referenceIndex, {
-        directives: uniqueDisplayTerms([...current.directives, directive]),
-        roles: uniqueDisplayTerms([...current.roles, ...roles]),
-      });
-    });
-  });
-
-  return directiveMap;
-}
-
 function collectDesignRequirementReferenceIndices(proposal: CompanyProjectProposal) {
-  const directiveIndices = Array.from(collectDesignRequirementImageDirectives(proposal).keys());
-  const allIndices = referenceIndicesFromRequirementText(String(proposal.design_requirement || ''));
-  return Array.from(new Set([...directiveIndices, ...allIndices])).sort((left, right) => left - right);
-}
-
-function designRequirementImageBindingSummary(images: ImageToImageInputImage[]) {
-  return images
-    .filter((image) => image.designRequirementDirective)
-    .map((image) => [
-      `${image.label}（图${image.designReferenceIndex || '-'}）`,
-      `开发思路原文：${image.designRequirementDirective}`,
-      image.designRequirementRoles?.length
-        ? `必须承担：${image.designRequirementRoles.join('、')}`
-        : '',
-    ].filter(Boolean).join('；'))
-    .join('\n');
-}
-
-function appendDesignRequirementImageBinding(
-  baseDetail: string,
-  image: ImageToImageInputImage,
-) {
-  if (!image.designRequirementDirective) {
-    return baseDetail;
-  }
-  return [
-    baseDetail,
-    `开发思路对图${image.designReferenceIndex || '-'}的具体要求：${image.designRequirementDirective}。`,
-    image.designRequirementRoles?.length
-      ? `该图在素材生成中必须承担：${image.designRequirementRoles.join('、')}。`
-      : '',
-    '不得把该图与其他参考图的职责混用。',
-  ].filter(Boolean).join(' ');
+  return referenceIndicesFromRequirementText(String(proposal.design_requirement || ''));
 }
 
 function removeCarrierSizePhrases(value: string) {
@@ -2809,7 +2731,7 @@ function materialExtractionInputImages(
     label: image.label,
     filename: image.filename,
     url: image.url,
-    detail: appendDesignRequirementImageBinding(image.detail, image),
+    detail: image.detail,
   }));
 }
 
@@ -2964,12 +2886,10 @@ function buildMaterialRefinementPrompt(
   textElements: string[],
   shapeLevel: MaterialShapeLevel,
   shapeAnalysis: MaterialShapeAnalysisResponse | null,
-  designRequirementDirectives: string[] = [],
 ) {
   const graphicElementSummary =
     graphicElements.length > 0 ? graphicElements.join('、') : '输入图中与开发需求匹配的主要图案元素';
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
-  const designRequirementSummary = designRequirementDirectives.join('；');
 
   return [
     `请基于输入图只提取【${shapeLevel.title}】，生成一张可直接用于后续图案设计的${shapeLevel.label}干净素材图。`,
@@ -2979,9 +2899,6 @@ function buildMaterialRefinementPrompt(
     textElementSummary
       ? `文字元素判定依据：${textElementSummary}`
       : '文字元素为空：不要提取、重绘或新增未要求的可读主题文字。',
-    designRequirementSummary
-      ? `公司开发思路/设计要求：${designRequirementSummary}。必须用来决定当前品类应该保留哪些现有素材；其中指定图几的要求只作用于对应公司设计参考图，不得把其他图职责强加给内部图库素材。`
-      : '',
     `来源素材：${sourceImageSummary(images)}。`,
     buildMaterialShapeAnalysisInstruction(shapeAnalysis, shapeLevel),
     `元素/文字分层判定：${buildShapeLevelElementJudgment(shapeLevel, graphicElementSummary, textElementSummary)}`,
@@ -3007,14 +2924,10 @@ function buildUnifiedMaterialBoardPrompt(
   textElements: string[],
   shapeAnalysis: MaterialShapeAnalysisResponse | null,
   sourceLabel = '输入素材图',
-  designRequirementDirectives: string[] = [],
 ) {
   const graphicElementSummary =
     graphicElements.length > 0 ? graphicElements.join('、') : '输入图中与开发需求匹配的主要图案元素';
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
-  const designRequirementSummary =
-    designRequirementDirectives.length > 0 ? designRequirementDirectives.join('；') : '';
-  const imageBindingSummary = designRequirementImageBindingSummary(images);
 
   return [
     `请基于输入的${sourceLabel}，整理成一张可用于后续图案设计的统一素材板。`,
@@ -3029,12 +2942,6 @@ function buildUnifiedMaterialBoardPrompt(
     textElementSummary
       ? `文字元素判定依据：${textElementSummary}`
       : '文字元素为空：不要新增未要求的可读主题文字。',
-    designRequirementSummary
-      ? `开发思路设计指令：${designRequirementSummary}。这些信息只用于判断哪些现有元素值得保留，不用于生成输入图中不存在的新图案。`
-      : '',
-    imageBindingSummary
-      ? `开发思路图片职责绑定（必须逐图执行，不得混用）：\n${imageBindingSummary}`
-      : '',
     `来源图片：${sourceImageSummary(images)}。`,
     '保留规则：保留输入图中已经存在的独立贴图、成品小图案、主题字形、角色、图标、边框和局部装饰；元素外观、配色、线条和水彩/纹理质感尽量不变。',
     '清理规则：必须去除尺寸标注、红色尺寸线、红色框选、cm/mm 数字、商品截图界面、下载/查看按钮、价格/平台/店铺信息、背景场景、阴影摄影质感和无关空白。',
@@ -3083,7 +2990,6 @@ function buildMaterialBoardRegenerationPrompt(
 function collectGenerationDesignReferenceImages(result: ProposalAgentPrepareResponse): ImageToImageInputImage[] {
   const requestedReferenceIndices = collectDesignRequirementReferenceIndices(result.proposal);
   const requestedReferenceIndexSet = new Set(requestedReferenceIndices);
-  const imageDirectiveMap = collectDesignRequirementImageDirectives(result.proposal);
   const designImages = (result.proposal.reference_images || []).filter(isCompanyDesignReferenceImage);
   const externalEvidenceImages = (result.proposal.reference_images || []).filter(isExternalEvidenceReferenceImage);
   const sourceImages = designImages.length > 0 ? designImages : externalEvidenceImages;
@@ -3099,17 +3005,13 @@ function collectGenerationDesignReferenceImages(result: ProposalAgentPrepareResp
       ? indexedDesignImages.filter((item) => requestedReferenceIndexSet.has(item.referenceIndex))
       : indexedDesignImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
   const finalDesignImages =
-    selectedDesignImages.length > 0
+    requestedReferenceIndices.length > 0
       ? selectedDesignImages
       : indexedDesignImages.slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES);
 
   return finalDesignImages
     .slice(0, MAX_DESIGN_REFERENCE_MATERIAL_IMAGES)
-    .map(({ image, referenceIndex }) => {
-      const imageDirective = imageDirectiveMap.get(referenceIndex);
-      const designRequirementDirective = imageDirective?.directives.join('；') || '';
-      const designRequirementRoleList = imageDirective?.roles || [];
-      return {
+    .map(({ image, referenceIndex }) => ({
         id: `design-reference-${referenceIndex}-${image.url}`,
         url: image.url,
         filename: image.filename || image.raw_path || `${sourceLabel} ${referenceIndex}`,
@@ -3117,21 +3019,13 @@ function collectGenerationDesignReferenceImages(result: ProposalAgentPrepareResp
           ? `开发思路指定${sourceLabel} ${referenceIndex}`
           : `${sourceLabel} ${referenceIndex}`,
         detail: requestedReferenceIndexSet.has(referenceIndex)
-          ? [
-              `开发思路指定${sourceLabel}${referenceIndex}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`,
-              designRequirementDirective
-                ? `具体要求：${designRequirementDirective}。必须按该图职责生成素材，不得与其他图的职责混用。`
-                : '',
-            ].filter(Boolean).join(' ')
+          ? `开发思路指定使用${sourceLabel}${referenceIndex}进入素材流程；开发思路只负责选图，不作为素材判断或素材生成提示词。原图不进入最终图生图。`
           : `${sourceLabel}，仅用于 AI 提取可用图案素材，不作为原图进入最终图生图。`,
         note: image.raw_path,
         selectedByDesignRequirement: requestedReferenceIndexSet.has(referenceIndex),
         designReferenceIndex: referenceIndex,
-        designRequirementDirective,
-        designRequirementRoles: designRequirementRoleList,
         sourceField: image.source_field,
-      };
-    });
+      }));
 }
 
 function buildDesignReferenceMaterialSplitPrompt(
@@ -3139,16 +3033,12 @@ function buildDesignReferenceMaterialSplitPrompt(
   graphicElements: string[],
   textElements: string[],
   shapeLevel: MaterialShapeLevel,
-  designRequirementDirectives: string[] = [],
   shapeAnalysis: MaterialShapeAnalysisResponse | null = null,
 ) {
   const sourceLabel = generationReferenceSourceLabel(images);
   const graphicElementSummary =
     graphicElements.length > 0 ? graphicElements.join('、') : '输入图中与开发需求匹配的主要图案元素';
   const textElementSummary = textElements.length > 0 ? textElements.join('、') : '';
-  const designRequirementSummary =
-    designRequirementDirectives.length > 0 ? designRequirementDirectives.join('；') : '';
-  const imageBindingSummary = designRequirementImageBindingSummary(images);
 
   return [
     `请基于输入的${sourceLabel}，只提取【${shapeLevel.title}】，整理成一张可用于后续图案设计的${shapeLevel.label}纯色背景素材图。`,
@@ -3159,12 +3049,6 @@ function buildDesignReferenceMaterialSplitPrompt(
       ? `文字元素判定依据：${textElementSummary}`
       : '文字元素为空：不要提取、重绘或新增未要求的可读主题文字。',
     `来源${sourceLabel}：${sourceImageSummary(images)}。`,
-    designRequirementSummary
-      ? `开发思路设计指令：${designRequirementSummary}。这些信息只用于判断输入图中哪些现有元素值得提取，不用于生成输入图中不存在的新图案；尺寸、规格和载体信息不参与素材提取。`
-      : '',
-    imageBindingSummary
-      ? `开发思路图片职责绑定（必须逐图执行，不得混用）：\n${imageBindingSummary}`
-      : '',
     buildMaterialShapeAnalysisInstruction(shapeAnalysis, shapeLevel),
     `元素/文字分层判定：${buildShapeLevelElementJudgment(shapeLevel, graphicElementSummary, textElementSummary)}`,
     `层级定义：${shapeLevel.focus}`,
@@ -3507,7 +3391,6 @@ function ImageToImageInputPanel({
         category: categoryOverride,
         graphic_elements: graphicElements,
         text_elements: textElements,
-        design_requirement_directives: designRequirementDirectives,
         input_images: materialExtractionInputImages(materialImages, 'material_shape_analysis_source'),
       });
 
@@ -3544,7 +3427,6 @@ function ImageToImageInputPanel({
         category: categoryOverride,
         graphic_elements: graphicElements,
         text_elements: textElements,
-        design_requirement_directives: designRequirementDirectives,
         input_images: materialExtractionInputImages(
           designReferenceImages,
           'design_reference_shape_analysis_source',
@@ -3692,7 +3574,6 @@ function ImageToImageInputPanel({
               textElements,
               shapeAnalysis,
               '图库/渠道素材图',
-              designRequirementDirectives,
             ),
           ].join('\n'),
           project_code: result.project_code,
@@ -3743,7 +3624,6 @@ function ImageToImageInputPanel({
               textElements,
               shapeLevel,
               shapeAnalysis,
-              designRequirementDirectives,
             ),
           ].join('\n'),
           project_code: result.project_code,
@@ -3820,7 +3700,6 @@ function ImageToImageInputPanel({
               textElements,
               shapeAnalysis,
               referenceSourceLabel,
-              designRequirementDirectives,
             ),
           ].join('\n'),
           project_code: result.project_code,
@@ -3888,7 +3767,6 @@ function ImageToImageInputPanel({
               graphicElements,
               textElements,
               shapeLevel,
-              designRequirementDirectives,
               shapeAnalysis,
             ),
           ].join('\n'),

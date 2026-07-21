@@ -299,8 +299,7 @@ function buildSystemPrompt() {
     '你是 MYML 图案素材提取流程里的“一级形/二级形/三级形判断 AI”。',
     '你的任务不是生成图片，也不是重新设计，而是观察输入图中真实存在的视觉内容，先判断是否有必要拆分成一级形/二级形/三级形；只有确实需要分层时，才判断每一层应该提取什么、保留什么、排除什么。',
     '必须严格区分商品载体、产品展示截图、包装、价格/店铺信息与真正可复用的图案素材。',
-    '开发思路 design_requirement_directives 是高优先级判断依据：如果开发思路写明“形状见图1、图案见图2、排版见参考图3、文案见文字元素、黑色底/纯白色”等关系，必须结合这些关系判断是否拆分、每一层从哪张图提取什么，不能只取其中一张参考图。',
-    '只有开发思路明确写出图号和具体要求时，才建立对应图片职责；如果没有出现具体图号或具体用途，不得虚构“图1负责主体、图2负责排版”等绑定，应根据全部输入图的真实视觉内容、主要图案元素和文字元素正常判断。',
+    '开发思路只在上游用于选择哪些公司设计参考图进入本步骤，不作为本步骤的图案提取提示词。你只能根据实际收到的图片、主要图案元素和文字元素判断是否拆分以及如何提取。',
     '当多张参考图承担不同角色时，应把图1/图2/图3/图4的角色分别纳入判断：形状/轮廓/载体外形通常只作为边界或版式依据，主题图案和文字字形可作为一级形或二级形，排版/边框/布局可作为二级形，细小点缀/纹理/重复符号可作为三级形。',
     '如果输入图已经是同一层级的多个独立贴图、成品小图案集合、素材板、刀模小图合集，且没有明显主视觉/辅助/点缀层级差异，则 split_required 必须为 false，不要强行拆成一级形、二级形、三级形。',
     '如果 split_required 为 false，只输出如何统一清理素材板：去除尺寸线、尺寸文字、边框框选、截图标注、背景和无关信息，保留每个独立可用图案素材。',
@@ -319,11 +318,6 @@ function buildUserPayload(request, inputImages) {
     source_label: sourceKindLabel(cleanString(request.source_kind || request.sourceKind)),
     graphic_elements: normalizeStringList(request.graphic_elements || request.graphicElements, 20, 120),
     text_elements: normalizeStringList(request.text_elements || request.textElements, 12, 120),
-    design_requirement_directives: normalizeStringList(
-      request.design_requirement_directives || request.designRequirementDirectives,
-      12,
-      180,
-    ),
     input_images: inputImages.map((image, index) => ({
       image_index: index + 1,
       role: image.role,

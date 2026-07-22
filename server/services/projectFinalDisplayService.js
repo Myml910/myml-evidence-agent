@@ -26,6 +26,9 @@ const {
 const FINAL_DISPLAY_PROMPT_TEMPLATE_ID = 'structured_ai';
 const FINAL_DISPLAY_FINAL_GENERATION_SOURCE = 'automated_flow_final_generation';
 const FINAL_DISPLAY_FLOW_VERSION = 'category_full_v3_reference_selection_only';
+const CATEGORY_IMAGE_CATALOG_READY = 'ready';
+const CATEGORY_IMAGE_CATALOG_MISSING = 'missing_from_category_image_catalog';
+const CATEGORY_IMAGE_CATALOG_UNUSABLE = 'category_image_unusable';
 const MATERIAL_BOARD_REVERSE_PROMPT_TEMPLATE_ID = 'material_board_reverse';
 const GENERATION_MATERIAL_MIN_SCORE = 0.8;
 const AGENT_FLOW_MAX_RETRIES = 3;
@@ -591,6 +594,10 @@ function buildProjectDataLayerFromLookup(result) {
   );
   const visibleText = visibleTextElementSummary(proposal.text_elements);
   const categoryTargets = categoryTargetsFromLookup(result);
+  const catalogTargets = categoryTargets.map((target) => categoryTargetCatalogRecord(result, target));
+  const missingCatalogCategories = catalogTargets
+    .filter((target) => target.catalogStatus !== CATEGORY_IMAGE_CATALOG_READY)
+    .map((target) => target.category);
   const categorySummary = categoryTargets.length > 0
     ? categoryTargets.map((target) => target.category).join(' / ')
     : cleanString(result?.category_judgment?.predicted_category || proposal.category_label || proposal.category);
@@ -601,12 +608,18 @@ function buildProjectDataLayerFromLookup(result) {
     sections: {
       categoryTargets: {
         title: 'category_targets',
-        count: categoryTargets.length,
-        items: categoryTargets.map((target) => ({
+        count: catalogTargets.length,
+        catalogCoverageStatus: missingCatalogCategories.length > 0 ? 'incomplete' : 'complete',
+        catalogReadyCount: catalogTargets.length - missingCatalogCategories.length,
+        missingCatalogCount: missingCatalogCategories.length,
+        missingCatalogCategories,
+        items: catalogTargets.map((target) => ({
           category: target.category,
           confidence: target.confidence,
           reason: target.reason,
-          hasHistoryTemplate: Boolean(historyImageFromCategoryTarget(result, target)),
+          hasCatalogEntry: target.hasCatalogEntry,
+          hasHistoryTemplate: target.hasHistoryTemplate,
+          catalogStatus: target.catalogStatus,
         })),
         usageScenario: 'For combo-category proposals, material extraction runs once while final prompt and final generation are repeated for each category-specific history layout template.',
       },
@@ -646,6 +659,7 @@ function buildFinalDisplayView(run, dataLayer = null) {
     materialImageBlock: Array.isArray(safeRun.elementImages) ? safeRun.elementImages : [],
     finalImageGeneration: Array.isArray(safeRun.finalDesignImages) ? safeRun.finalDesignImages : [],
     projectDataLayer,
+    categoryCoverage: buildCategoryCoverage(safeRun, projectDataLayer),
   };
 }
 
@@ -757,7 +771,9 @@ function categoryTargetsFromLookup(result) {
 }
 
 function historyImageFromCategoryTarget(result, target) {
-  const categoryImage = target?.categoryImage || result?.category_judgment?.category_image;
+  const categoryImage = target
+    ? target.categoryImage
+    : result?.category_judgment?.category_image;
   const candidates = Array.isArray(categoryImage?.history_images) && categoryImage.history_images.length > 0
     ? categoryImage.history_images
     : categoryImage
@@ -779,6 +795,108 @@ function historyImageFromCategoryTarget(result, target) {
     url: safeImageUrl(first.image_url),
     detail: cleanString(first.note).slice(0, 300) || 'History layout reference for final design generation.',
   };
+}
+
+function categoryTargetCatalogRecord(result, target) {
+  const historyImage = historyImageFromCategoryTarget(result, target);
+  const hasCatalogEntry = Boolean(target?.categoryImage);
+  return {
+    ...target,
+    hasCatalogEntry,
+    hasHistoryTemplate: Boolean(historyImage),
+    catalogStatus: historyImage
+      ? CATEGORY_IMAGE_CATALOG_READY
+      : hasCatalogEntry
+        ? CATEGORY_IMAGE_CATALOG_UNUSABLE
+        : CATEGORY_IMAGE_CATALOG_MISSING,
+  };
+}
+
+function categoryCoverageItems(dataLayer = null) {
+  const section = dataLayer?.sections?.categoryTargets;
+  return Array.isArray(section?.items) ? section.items : [];
+}
+
+function buildCategoryCoverage(run = {}, dataLayer = null) {
+  const targets = categoryCoverageItems(dataLayer);
+  const finalImages = Array.isArray(run?.finalDesignImages) ? run.finalDesignImages : [];
+  const finalCountByCategory = new Map();
+
+  for (const image of finalImages) {
+    const category = cleanString(image?.category);
+    if (!category) continue;
+    const key = category.toLocaleLowerCase();
+    finalCountByCategory.set(key, (finalCountByCategory.get(key) || 0) + 1);
+  }
+
+  const items = targets.map((target) => {
+    const category = cleanString(target?.category);
+    const finalImageCount = finalCountByCategory.get(category.toLocaleLowerCase()) || 0;
+    const catalogStatus = cleanString(target?.catalogStatus) || (
+      target?.hasHistoryTemplate
+        ? CATEGORY_IMAGE_CATALOG_READY
+        : target?.hasCatalogEntry
+          ? CATEGORY_IMAGE_CATALOG_UNUSABLE
+          : CATEGORY_IMAGE_CATALOG_MISSING
+    );
+    return {
+      category,
+      catalogStatus,
+      hasCatalogEntry: Boolean(target?.hasCatalogEntry),
+      hasHistoryTemplate: Boolean(target?.hasHistoryTemplate),
+      finalImageCount,
+      hasFinalImage: finalImageCount > 0,
+    };
+  });
+  const missingCatalogCategories = items
+    .filter((item) => item.catalogStatus !== CATEGORY_IMAGE_CATALOG_READY)
+    .map((item) => item.category)
+    .filter(Boolean);
+  const missingFinalCategories = items
+    .filter((item) => !item.hasFinalImage)
+    .map((item) => item.category)
+    .filter(Boolean);
+
+  return {
+    status: items.length === 0
+      ? 'unknown'
+      : missingCatalogCategories.length > 0 || missingFinalCategories.length > 0
+        ? 'incomplete'
+        : 'complete',
+    detectedCategoryCount: items.length,
+    catalogReadyCategoryCount: items.length - missingCatalogCategories.length,
+    missingCatalogCategoryCount: missingCatalogCategories.length,
+    finalImageCount: finalImages.length,
+    finalCategoryCount: items.length - missingFinalCategories.length,
+    detectedCategories: items.map((item) => item.category).filter(Boolean),
+    missingCatalogCategories,
+    missingFinalCategories,
+    items,
+  };
+}
+
+function categoryCoverageWarnings(coverage = {}) {
+  const warnings = [];
+  const missingCatalogCategories = Array.isArray(coverage.missingCatalogCategories)
+    ? coverage.missingCatalogCategories.filter(Boolean)
+    : [];
+  const missingFinalCategories = Array.isArray(coverage.missingFinalCategories)
+    ? coverage.missingFinalCategories.filter(Boolean)
+    : [];
+  const missingFinalWithoutCatalog = missingFinalCategories.filter(
+    (category) => !missingCatalogCategories.includes(category),
+  );
+
+  if (missingCatalogCategories.length > 0) {
+    warnings.push(
+      'category_image_catalog_incomplete',
+      `category_image_catalog_missing:${missingCatalogCategories.join('|')}`,
+    );
+  }
+  if (missingFinalWithoutCatalog.length > 0) {
+    warnings.push(`category_final_image_missing:${missingFinalWithoutCatalog.join('|')}`);
+  }
+  return warnings;
 }
 
 function historyImageFromLookup(result) {
@@ -1817,7 +1935,7 @@ function startProjectFinalDisplayJob({
       await reportProgress({
         stage: 'project_final_display',
         status: blocked ? 'blocked' : partial ? 'partial' : 'success',
-        runStatus: blocked ? 'blocked' : 'completed',
+        runStatus: blocked ? 'blocked' : partial ? 'partial' : 'completed',
         attempt: 1,
         maxAttempts: 1,
         durationMs: job.finishedAt - job.startedAt,
@@ -1903,8 +2021,11 @@ async function generateProjectFinalDisplayNow({
       designReferenceImages: safeDesignReferenceImages,
       projectDataLayer: dataLayer,
     }, publicBaseUrl);
+    const categoryCoverage = buildCategoryCoverage(responseRun, dataLayer);
     return {
-      status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
+      status: cleanString(cachedRun.progress?.status) === 'partial' || categoryCoverage.status === 'incomplete'
+        ? 'partial'
+        : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: code },
       designReferenceImages: safeDesignReferenceImages,
@@ -1912,7 +2033,10 @@ async function generateProjectFinalDisplayNow({
       dataLayer,
       display: buildFinalDisplayView(responseRun, dataLayer),
       usage: { providerCost: false },
-      warnings: referenceMediaWarnings(referenceMedia.failureCount),
+      warnings: [
+        ...categoryCoverageWarnings(categoryCoverage),
+        ...referenceMediaWarnings(referenceMedia.failureCount),
+      ],
     };
   }
 
@@ -2109,11 +2233,12 @@ async function generateProjectFinalDisplayNow({
     .map((group) => group.target);
   const readyFinalGroups = categoryMaterialGroups.filter((group) => group.target.historyImage);
   if (readyFinalGroups.length === 0) {
+    const categoryCoverage = buildCategoryCoverage(generationOutputRun(currentRun), dataLayer);
     if (options.synchronous === true) {
       await reportProgress({
         stage: 'project_final_display',
         status: 'partial',
-        runStatus: 'completed',
+        runStatus: 'partial',
         attempt: 1,
         maxAttempts: 1,
       });
@@ -2129,6 +2254,7 @@ async function generateProjectFinalDisplayNow({
       status: 'partial',
       reason: 'missing_history_layout_image',
       warnings: [
+        ...categoryCoverageWarnings(categoryCoverage),
         'Default automatic final-display flow requires a category history layout image before final image generation.',
         `Missing category history layouts: ${missingHistoryTargets.map((target) => target.category).join(', ')}`,
         ...mediaWarnings,
@@ -2215,18 +2341,29 @@ async function generateProjectFinalDisplayNow({
       currentRun;
   }) || currentRun;
 
-  const completionStatus = missingHistoryTargets.length > 0 ? 'partial' : 'completed';
+  const outputRun = generationOutputRun(
+    latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun,
+  );
+  const categoryCoverage = buildCategoryCoverage(outputRun, dataLayer);
+  const completionStatus = categoryCoverage.status === 'incomplete' || missingHistoryTargets.length > 0
+    ? 'partial'
+    : 'completed';
   if (options.synchronous === true) {
     await reportProgress({
       stage: 'project_final_display',
       status: completionStatus === 'partial' ? 'partial' : 'success',
-      runStatus: 'completed',
+      runStatus: completionStatus,
       attempt: 1,
       maxAttempts: 1,
     });
   }
-  const run = generationOutputRun(latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || currentRun);
-  const responseRun = runWithPublicUrls(run, publicBaseUrl);
+  const run = generationOutputRun(
+    latestOutputRunForCode(dependencies, code) || latestProjectRunForCode(dependencies, code) || outputRun,
+  );
+  const responseRun = runWithPublicUrls({
+    ...run,
+    status: completionStatus,
+  }, publicBaseUrl);
   return {
     status: completionStatus,
     source: 'generated_project_final_display',
@@ -2236,7 +2373,11 @@ async function generateProjectFinalDisplayNow({
     dataLayer,
     display: buildFinalDisplayView(responseRun, dataLayer),
     usage: { providerCost: true },
-    warnings: [...partialHistoryWarnings, ...mediaWarnings],
+    warnings: [
+      ...categoryCoverageWarnings(categoryCoverage),
+      ...partialHistoryWarnings,
+      ...mediaWarnings,
+    ],
   };
 }
 
@@ -2262,7 +2403,7 @@ async function prepareProjectFinalDisplay({
   if (requestedStatus === 'failed' || requestedStatus === 'cancelled') {
     throw terminalProjectRunError(requestedRun);
   }
-  if (requestedStatus === 'blocked') {
+  if (requestedStatus === 'blocked' || requestedStatus === 'partial') {
     const outputRun = generationOutputRun(requestedRun) || requestedRun;
     const referenceMedia = await persistDesignReferenceMediaForRun({
       dependencies,
@@ -2280,6 +2421,7 @@ async function prepareProjectFinalDisplay({
         dataLayer: referenceMedia.dataLayer,
       });
     }
+    const categoryCoverage = buildCategoryCoverage(outputRun, referenceMedia.dataLayer);
     return buildTerminalProjectFinalDisplayResult({
       normalizedCode,
       publicBaseUrl,
@@ -2288,8 +2430,14 @@ async function prepareProjectFinalDisplay({
       run: outputRun,
       runId: requestedRun.runId,
       dataLayer: referenceMedia.dataLayer,
-      reason: 'persisted_project_final_display_blocked',
-      warnings: referenceMediaWarnings(referenceMedia.failureCount),
+      status: requestedStatus,
+      reason: requestedStatus === 'partial'
+        ? 'persisted_project_final_display_partial'
+        : 'persisted_project_final_display_blocked',
+      warnings: [
+        ...categoryCoverageWarnings(categoryCoverage),
+        ...referenceMediaWarnings(referenceMedia.failureCount),
+      ],
     });
   }
 
@@ -2364,8 +2512,11 @@ async function prepareProjectFinalDisplay({
       designReferenceImages: safeDesignReferenceImages,
       projectDataLayer: dataLayer,
     }, publicBaseUrl);
+    const categoryCoverage = buildCategoryCoverage(responseRun, dataLayer);
     return {
-      status: cleanString(cachedRun.progress?.status) === 'partial' ? 'partial' : 'completed',
+      status: cleanString(cachedRun.progress?.status) === 'partial' || categoryCoverage.status === 'incomplete'
+        ? 'partial'
+        : 'completed',
       source: 'cached_project_final_display',
       project: cachedRun.project || lookupData?.project || { projectCode: normalizedCode },
       designReferenceImages: safeDesignReferenceImages,
@@ -2373,7 +2524,10 @@ async function prepareProjectFinalDisplay({
       dataLayer,
       display: buildFinalDisplayView(responseRun, dataLayer),
       usage: { providerCost: false },
-      warnings: referenceMediaWarnings(referenceMedia.failureCount),
+      warnings: [
+        ...categoryCoverageWarnings(categoryCoverage),
+        ...referenceMediaWarnings(referenceMedia.failureCount),
+      ],
     };
   }
 

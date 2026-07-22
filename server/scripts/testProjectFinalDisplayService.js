@@ -875,6 +875,39 @@ async function main() {
   assert(combo.run.elementImages.every((image) => image.source === 'design_reference_split_regeneration'));
   assert.strictEqual(combo.run.finalDesignImages.length, 2);
   assert.strictEqual(combo.display.projectDataLayer.sections.categoryTargets.count, 2);
+  assert.strictEqual(
+    combo.display.projectDataLayer.sections.categoryTargets.catalogCoverageStatus,
+    'complete',
+  );
+  assert.deepStrictEqual(combo.display.categoryCoverage, {
+    status: 'complete',
+    detectedCategoryCount: 2,
+    catalogReadyCategoryCount: 2,
+    missingCatalogCategoryCount: 0,
+    finalImageCount: 2,
+    finalCategoryCount: 2,
+    detectedCategories: ['餐盘', '纸巾'],
+    missingCatalogCategories: [],
+    missingFinalCategories: [],
+    items: [
+      {
+        category: '餐盘',
+        catalogStatus: 'ready',
+        hasCatalogEntry: true,
+        hasHistoryTemplate: true,
+        finalImageCount: 1,
+        hasFinalImage: true,
+      },
+      {
+        category: '纸巾',
+        catalogStatus: 'ready',
+        hasCatalogEntry: true,
+        hasHistoryTemplate: true,
+        finalImageCount: 1,
+        hasFinalImage: true,
+      },
+    ],
+  });
   assert.strictEqual(comboGenerateCalls.length, 14);
   assert.strictEqual(
     comboGenerateCalls.filter((call) => call.source === 'company_design_reference_split').length,
@@ -981,17 +1014,28 @@ async function main() {
     ['envelope greeting card'],
   );
   assert(partialCategoryResult.warnings.includes('partial_history_layout_coverage'));
+  assert(partialCategoryResult.warnings.includes('category_image_catalog_incomplete'));
+  assert(partialCategoryResult.warnings.includes('category_image_catalog_missing:wind chime'));
   assert(partialCategoryResult.warnings.some((warning) => warning.includes('wind chime')));
   assert.deepStrictEqual(
     partialCategoryResult.display.projectDataLayer.sections.categoryTargets.items
-      .map((target) => [target.category, target.hasHistoryTemplate]),
+      .map((target) => [target.category, target.catalogStatus, target.hasHistoryTemplate]),
     [
-      ['wind chime', false],
-      ['envelope greeting card', true],
+      ['wind chime', 'missing_from_category_image_catalog', false],
+      ['envelope greeting card', 'ready', true],
     ],
   );
+  assert.deepStrictEqual(partialCategoryResult.display.categoryCoverage.missingCatalogCategories, [
+    'wind chime',
+  ]);
+  assert.deepStrictEqual(partialCategoryResult.display.categoryCoverage.missingFinalCategories, [
+    'wind chime',
+  ]);
+  assert.strictEqual(partialCategoryResult.display.categoryCoverage.detectedCategoryCount, 2);
+  assert.strictEqual(partialCategoryResult.display.categoryCoverage.catalogReadyCategoryCount, 1);
+  assert.strictEqual(partialCategoryResult.display.categoryCoverage.finalCategoryCount, 1);
   const persistedPartialCategory = getLatestProjectRunForCode('YXF2511160011', storeOptions);
-  assert.strictEqual(persistedPartialCategory.status, 'completed');
+  assert.strictEqual(persistedPartialCategory.status, 'partial');
   assert.strictEqual(persistedPartialCategory.progress.status, 'partial');
   const partialGenerateCallCount = partialGenerateCalls.length;
   const cachedPartialCategoryResult = await prepareProjectFinalDisplay({
@@ -1001,7 +1045,7 @@ async function main() {
     options: { synchronous: true },
   });
   assert.strictEqual(cachedPartialCategoryResult.status, 'partial');
-  assert.strictEqual(cachedPartialCategoryResult.source, 'cached_project_final_display');
+  assert.strictEqual(cachedPartialCategoryResult.source, 'generated_project_final_display');
   assert.strictEqual(partialGenerateCalls.length, partialGenerateCallCount);
 
   const noHistoryResult = await prepareProjectFinalDisplay({
@@ -1045,9 +1089,13 @@ async function main() {
   assert.strictEqual(noHistoryResult.run.finalDesignImages.length, 0);
   assert.strictEqual(noHistoryResult.display.materialImageBlock.length, 3);
   assert.strictEqual(noHistoryResult.display.finalImageGeneration.length, 0);
+  assert.deepStrictEqual(noHistoryResult.display.categoryCoverage.missingCatalogCategories, [
+    'wind chime',
+  ]);
+  assert.strictEqual(noHistoryResult.display.categoryCoverage.finalImageCount, 0);
   assert(noHistoryResult.warnings.some((warning) => warning.includes('wind chime')));
   const persistedNoHistoryResult = getLatestProjectRunForCode('YXF2511160012', storeOptions);
-  assert.strictEqual(persistedNoHistoryResult.status, 'completed');
+  assert.strictEqual(persistedNoHistoryResult.status, 'partial');
   assert.strictEqual(persistedNoHistoryResult.progress.status, 'partial');
 
   console.log('[test:project-final-display] Project final display tests passed.');
